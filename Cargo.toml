@@ -1,0 +1,34 @@
+[package]
+name        = "rust_pii_transformer"
+version     = "0.1.0"
+edition     = "2021"
+license     = "Apache-2.0"
+description = "Deterministic Korean PII detection and masking with guaranteed source-offset recovery. Pure Rust, no models."
+repository  = "https://github.com/arabangoo/rust_pii_transformer"
+readme      = "README.md"
+keywords    = ["pii", "korean", "masking", "privacy", "redaction"]
+categories  = ["text-processing"]
+
+# ── 독립성 원칙(README 3절·16절) ─────────────────────────────────
+# 기본 빌드 = pure Rust / zero FFI / zero subprocess / zero network.
+# 모델 파일도 없다. 탐지는 규칙과 체크섬으로만 한다.
+
+[lib]
+name = "rust_pii_transformer"
+# rlib: 일반 Rust 소비자·테스트용, cdylib: 향후 PyO3 확장 모듈용
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# 코어(오프셋 매핑·정규화·탐지·마스킹)는 항상 빌드된다.
+default = []
+
+# 아래 feature 는 해당 코드가 실제로 들어오는 단계에서 함께 추가한다.
+# 데드 feature 를 미리 선언하지 않는다(형제 레포 rust_ocr_transformer 와 같은 규칙).
+#   hash   = ["dep:sha2", "dep:hmac"]   해시 가명화 마스킹 정책 (단계 6)
+#   synth  = ["dep:rand"]               합성 검증 데이터 생성기 (단계 4)
+#   cli    = ["dep:clap"]               명령줄 도구 rpit        (단계 7)
+#   python = ["dep:pyo3"]               PyO3 바인딩             (단계 7)
+
+[dependencies]
+thiserror = "2"
+serde     = { version = "1", features = ["derive"] }
