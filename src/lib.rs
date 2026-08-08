@@ -29,6 +29,7 @@
 //! | 모듈 | 상태 |
 //! | --- | --- |
 //! | [`span`] | 동작 확인. `SpanMap`, `Segment`, 합성, 역방향 매핑, 불변식 검사 |
+//! | `python` | 동작 확인. `span` 층의 PyO3 바인딩 (`--features python`) |
 //! | `normalize` | 미구현 |
 //! | `detect` | 미구현 |
 //! | `mask` | 미구현 |
@@ -56,6 +57,10 @@
 
 pub mod error;
 pub mod span;
+
+/// PyO3 바인딩. `--features python` 일 때만 빌드된다.
+#[cfg(feature = "python")]
+pub mod python;
 
 pub use error::{Error, Result};
 pub use span::{

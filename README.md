@@ -9,10 +9,16 @@
 핵심 자료구조와 알고리즘 설계, 공개 API, 명령줄 도구(CLI)와 Python 바인딩, 빌드와 테스트, 개발 로드맵,
 그리고 **현재 구현되지 않은 범위**까지 모두 담는다.
 
-**현재 상태: 오프셋 매핑 층만 구현돼 있다.** [6. 오프셋 매핑 설계](#6-오프셋-매핑-설계)의 `span` 모듈은
-동작하고 테스트를 통과한다. 정규화 패스, 탐지, 마스킹은 아직 없다. 나머지 절의 코드는 확정된 설계안이며
+**현재 상태: 오프셋 매핑 층과 그 Python 바인딩만 구현돼 있다.**
+[6. 오프셋 매핑 설계](#6-오프셋-매핑-설계)의 `span` 모듈은 동작하고 테스트를 통과하며,
+[15. Python 바인딩](#15-python-바인딩)으로 그 층을 Python 에서 쓸 수 있다.
+정규화 패스, 탐지, 마스킹은 아직 없다. 나머지 절의 코드는 확정된 설계안이며
 실제 동작하는 코드가 아니다. 진행 상황은 [17. 개발 로드맵과 현재 상태](#17-개발-로드맵과-현재-상태)에 3단계
 (동작 확인 / 코드만 존재 / 미구현)로 구분해 기록한다.
+
+**배포 상태: 아직 어디에도 게시하지 않았다.** 패키지 이름이 약속하는 탐지·마스킹이 없는 동안은
+crates.io 와 PyPI 어느 쪽에도 올리지 않는다. 검색으로 유입된 사람이 개인정보 탐지를 기대하고
+설치하는 일을 만들지 않기 위해서다. 게시 기준은 [17.1 배포 전 관문](#171-배포-전-관문)에 적는다.
 
 ---
 
@@ -594,21 +600,84 @@ rpit synth --entity rrn --variants all --count 100
 ## 15. Python 바인딩
 
 PyO3 로 abi3(파이썬 안정 이진 인터페이스) 휠을 만들어 Python 3.9 이상 전 플랫폼에서
-Rust 툴체인 없이 설치되게 한다.
+Rust 툴체인 없이 설치되게 한다. **구현돼 있고 동작한다.** 단 노출 범위는 지금 실제로 도는
+`span` 층까지다. `detect` 와 `mask` 는 **함수 자체를 만들지 않았다** — 던지기만 하는 껍데기를
+미리 노출하면 소비자가 그것을 있는 기능으로 오해하기 때문이다. 현재 범위는 런타임에서
+`rust_pii_transformer.__status__` 로 확인할 수 있다.
+
+### 지금 쓸 수 있는 것
 
 ```python
 import rust_pii_transformer as rpit
 
-findings = rpit.detect(text)
-for f in findings:
-    print(f.entity, f.source_char_start, f.source_char_end, f.certainty, f.score)
+rpit.__status__          # 'span layer only — normalize, detect, and mask are not implemented yet'
 
-out = rpit.mask(text, policy="tokenize")
-assert rpit.unmask(out.text, out.restore) == text
+# 정규화 패스 하나를 흉내 낸다. "880101-1234567" 에서 하이픈을 흡수한다.
+b = rpit.SpanMapBuilder()
+b.keep("880101")
+b.absorb("-", "separator.hyphen", "separator")
+b.keep("1234567")
+normalized, smap = b.finish()          # '8801011234567'
+smap.validate()                        # 불변식이 깨졌으면 SpanMapError
+
+# 정규화문에서 찾은 스팬을 원문 좌표로 되돌린다.
+src = smap.to_source(rpit.Span(0, 13, 0, 13))
+src.byte_start, src.byte_end           # (0, 14) — 원문에서는 하이픈까지 14바이트
+src.snapped                            # False
+src.rules                              # ['separator.hyphen'] — 판정 근거
+src.cost.absorbed_separators           # 1
 ```
 
-문자 오프셋을 그대로 노출하는 것이 중요하다. Python 문자열은 문자 인덱스 기반이라
-바이트 오프셋만 주면 소비자 쪽에서 다시 변환해야 하고, 그 변환이 새로운 오프셋 버그의 출처가 된다.
+### 문자 좌표가 1급 시민이다
+
+Python 문자열은 문자 인덱스 기반이라 바이트 오프셋만 주면 소비자 쪽에서 다시 변환해야 하고,
+그 변환이 새로운 오프셋 버그의 출처가 된다. 그래서 모든 스팬이 두 좌표를 함께 내고,
+문자 좌표만 아는 흔한 상황을 위한 진입점을 따로 둔다.
+
+```python
+start = normalized.index("880101")     # Python 의 index 는 문자 기준이다
+src = smap.to_source_from_chars(normalized, start, start + 6)
+src.span.slice(source_text)            # 원문 조각을 그대로 잘라 낸다
+```
+
+### 공개 표면
+
+| 이름 | 내용 |
+| --- | --- |
+| `Span(byte_start, byte_end, char_start, char_end)` | 구간. `Span.from_char_range(text, s, e)` 로 문자 좌표만으로도 만든다. `slice(text)` 로 조각을 낸다 |
+| `SpanMapBuilder(text=None)` | `keep` · `replace` · `numeral` · `absorb` 로 조각을 넘기고 `finish()` 가 `(정규화문, SpanMap)` 을 낸다 |
+| `SpanMap` | `identity(text)` · `compose(inner, outer)` · `to_source(span)` · `to_source_from_chars(...)` · `validate()` · `segments` · `to_json()` |
+| `SourceSpan` | `span` · `byte_start` · `char_start` · `snapped` · `rules` · `cost` · `to_json()` |
+| `Segment` · `NormalizationCost` | 세그먼트 내성과 정규화 비용 |
+| `SpanMapError` | 불변식 위반과 좌표계 불일치 |
+
+`absorb` 의 세 번째 인자는 `"whitespace"` · `"separator"` · `"other"` 중 하나다. 종류마다 신뢰도
+감점 계수가 다르므로 정확히 골라야 하고, 다른 값을 주면 `ValueError` 가 난다.
+
+### 경계에서 지키는 두 가지
+
+- **패닉을 Python 으로 넘기지 않는다.** 코어의 `Span::slice` 는 범위 밖에서 패닉하고, `finish` 는
+  빌더를 소비한다. 바인딩은 그 앞에서 검사해 `ValueError` 와 `RuntimeError` 로 바꾼다.
+  인터프리터를 죽이는 대신 잡을 수 있는 예외를 낸다.
+- **코어를 오염시키지 않는다.** `span` 의 타입에 `#[pyclass]` 를 직접 달지 않고 `src/python.rs`
+  안의 래퍼에만 붙인다. 그래서 기본 빌드에는 PyO3 가 전혀 들어오지 않는다(16절 독립성 원칙).
+
+### 알려진 대가: 규칙 이름 인터닝
+
+코어는 규칙 이름을 `&'static str` 로 들고 다녀 힙 할당을 0 으로 만든다(6절). 그 선택이 Python
+경계에서 대가를 만든다. 런타임에 들어온 문자열에는 `'static` 수명이 없으므로 누출로 승격시켜야
+한다. 같은 이름은 한 번만 누출되도록 풀에 담으므로, 규칙 이름이 설계대로 고정된 소수 집합이면
+풀 크기는 상수에 수렴한다.
+
+**호출자가 매번 새 규칙 이름을 만들어 넣으면**(예: 반복문에서 `f"rule.{i}"`) **그만큼 메모리가
+누적되고 회수되지 않는다.** 규칙 이름은 상수로 두고 가변값은 다른 인자로 넘기는 것이 올바른
+사용법이다.
+
+### 노출하지 않은 것
+
+`SpanMapBuilder.insert` 는 코어에 있지만 Python 으로 내지 않았다. 현재 정규화 파이프라인이 쓰지
+않는 경로이고, 합성 시 불변식과 결합법칙이 깨지는 것이 실측으로 확인됐기 때문이다
+([18. 알려진 한계](#18-알려진-한계)). 그 경로가 정리되면 함께 추가한다.
 
 ---
 
@@ -621,10 +690,14 @@ crate-type = ["rlib", "cdylib"]
 [features]
 # 코어(오프셋 매핑, 정규화, 탐지, 전체치환·부분노출·토큰화 마스킹)는 항상 빌드된다.
 default = []
+# Python 바인딩(PyO3 cdylib). abi3 휠.
+python  = ["dep:pyo3", "dep:serde_json"]
 
 [dependencies]
-thiserror = "2"
-serde     = { version = "1", features = ["derive"] }
+thiserror  = "2"
+serde      = { version = "1", features = ["derive"] }
+pyo3       = { version = "0.29", optional = true, features = ["extension-module", "abi3-py39"] }
+serde_json = { version = "1", optional = true }
 ```
 
 **아래 feature 는 아직 선언돼 있지 않다.** 해당 코드가 실제로 들어오는 단계에서 함께 추가한다.
@@ -635,9 +708,15 @@ serde     = { version = "1", features = ["derive"] }
 | `hash` | `sha2`, `hmac` | 마스킹 층 |
 | `synth` | `rand` | 합성 검증 코퍼스 |
 | `cli` | `clap` | 명령줄 도구 |
-| `python` | `pyo3` | Python 바인딩 |
 
-같은 이유로 `[[bin]]` 항목과 `pyproject.toml` 도 해당 단계에서 만든다.
+같은 이유로 `[[bin]]` 항목은 명령줄 도구 단계에서 만든다. `pyproject.toml` 은 Python 바인딩이
+실제로 들어왔으므로 이미 있다.
+
+### 최소 Rust 버전
+
+기본 빌드는 **1.71** 이면 된다(`thiserror` 2 가 상한). `--features python` 은 PyO3 0.29 때문에
+**1.83** 이 필요하다. 옵트인 경로 하나 때문에 코어 소비자 전체를 1.83 으로 올리지 않으려고
+`package.rust-version` 은 1.71 로 두고 차이를 여기에 적는다.
 
 **독립성 원칙: 기본 빌드는 순수 Rust, 외부 함수 인터페이스 0, 하위 프로세스 호출 0.**
 모든 의존 크레이트가 순수 Rust 이므로 정적 빌드가 가능하고, 폐쇄망에서 그대로 돈다.
@@ -646,15 +725,27 @@ serde     = { version = "1", features = ["derive"] }
 # 라이브러리
 cargo build
 
-# 명령줄 도구 포함
-cargo build --features cli --release
-
 # 테스트
 cargo test
 cargo clippy --all-targets -- -D warnings
 
-# Python 확장 (개발 설치)
-maturin develop --features python
+# Python 확장 (개발 설치) — pyproject.toml 이 features = ["python"] 을 이미 지정한다
+pip install maturin
+maturin develop
+pytest tests/test_python_binding.py
+
+# Python 바인딩까지 포함한 검사
+cargo clippy --features python --all-targets -- -D warnings
+```
+
+maturin 없이 확장 모듈을 확인하려면 cargo 로 cdylib 를 만든 뒤 확장자만 바꿔 경로에 두면 된다.
+플랫폼별 산출물 이름이 다르다.
+
+```bash
+cargo build --features python --release
+# Windows:  target/release/rust_pii_transformer.dll     -> rust_pii_transformer.pyd
+# Linux:    target/release/librust_pii_transformer.so   -> rust_pii_transformer.so
+# macOS:    target/release/librust_pii_transformer.dylib -> rust_pii_transformer.so
 ```
 
 ---
@@ -673,7 +764,14 @@ maturin develop --features python
 | 4 | `synth` 합성 데이터 생성기 | 생성물이 자기 검증기를 통과 | 미구현 |
 | 5 | `detect` 모듈 (엔티티별 인식기, 체크섬, 문맥 점수) | 합성 코퍼스 기준 재현율·정밀도 수치 | 미구현 |
 | 6 | `mask` 모듈 (정책 4종, 복원) | 왕복 복원 실패 0건 | 미구현 |
-| 7 | 명령줄 도구, Python 바인딩, `pyproject.toml` | `cargo test`, `cargo clippy`, maturin 빌드 | 미구현 |
+| 7a | Python 바인딩 (`src/python.rs`, `pyproject.toml`) | Python 테스트 24건 통과, `cargo clippy --features python` 경고 0 | **동작 확인** |
+| 7b | 명령줄 도구 `rpit` | `cargo test`, `cargo clippy` | 미구현 |
+
+단계 7a 를 5·6 보다 먼저 한 것은 순서를 앞당긴 것이 아니라 **노출 범위를 그 시점의 구현으로
+제한했기** 때문이다. 바인딩은 지금 실제로 도는 `span` 층만 낸다. 탐지·마스킹 층이 들어오면
+그때 같은 파일에 함수를 추가한다. 바인딩 검증은 확장 모듈을 실제로 적재해 Python 에서 주행하는
+방식으로 했고(Windows·CPython 3.12·abi3-py39 휠), 원문 좌표 복원·경계 스냅·한글 바이트와 문자
+좌표 분리·합성·JSON 내보내기·예외 변환을 모두 확인했다.
 
 단계 2까지의 검증 상태를 구체적으로 적으면 이렇다. 네 불변식 중 **피복·합성 결합법칙**은 구현되어
 테스트로 강제되고 있고, **왕복**과 **무손실 마스킹**은 각각 정규화 층과 마스킹 층이 있어야 검증 가능하므로
@@ -692,6 +790,27 @@ maturin develop --features python
 - 기본 기능만으로 외부 동적 라이브러리 의존이 0
 - 미구현과 미검증 범위를 이 문서에 정직하게 명시
 
+### 17.1 배포 전 관문
+
+**아직 crates.io 와 PyPI 어느 쪽에도 게시하지 않았다.** 기술적으로는 지금도 게시할 수 있지만
+하지 않는 이유가 있다. 패키지 이름과 설명이 약속하는 것은 한국어 개인정보 탐지·마스킹인데
+현재 제공하는 것은 오프셋 매핑 자료구조 하나다. 검색으로 유입된 사람이 탐지를 기대하고 설치했다가
+아무것도 못 잡는 상황을 만들지 않는다. 게시는 되돌릴 수 없다 — crates.io 는 삭제가 아니라
+yank 만 되고, PyPI 도 같은 버전 번호를 다시 쓸 수 없다.
+
+게시 전에 통과해야 할 것.
+
+| 관문 | 내용 | 상태 |
+| --- | --- | --- |
+| `insert` 경로 정리 | 합성 시 불변식·결합법칙이 깨지는 것이 실측됨. 제거하거나 고친다 | 미해결 |
+| 탐지·마스킹 동작 | 단계 5·6 완료. 이름이 약속하는 기능이 실제로 있어야 한다 | 미해결 |
+| 재현율·정밀도 수치 | 합성 코퍼스 기준 숫자 제시 | 미해결 |
+| 지속적 통합 | 다중 플랫폼 `cargo test` · `clippy` · 휠 빌드 자동화 | 미해결 |
+| 다중 플랫폼 휠 | 현재 Windows CPython 3.12 에서만 실측. Linux · macOS 미검증 | 미해결 |
+
+이름 선점이 급하면 `0.0.x` 로 범위를 설명에 명시해 올리는 선택지가 있으나, 그것도 위 `insert`
+관문은 먼저 통과해야 한다.
+
 ---
 
 ## 18. 알려진 한계
@@ -706,6 +825,22 @@ maturin develop --features python
 - **고민감도 항목의 재현율은 낮다.** 다국어 벤치마크에서 규칙 기반 탐지기가 이 영역에서 무너지는 것이
   이미 관측돼 있다. 이 라이브러리도 예외가 아니다
 - **생년월일은 일반 날짜와 구분되지 않는다.** 문맥 단서에 전적으로 의존한다
+
+### 확인된 결함: `insert` 세그먼트 경로
+
+`SpanMapBuilder::insert` 와 `SegmentKind::Insert` 는 "확장 대비"로 두었으나 **실측으로 두 가지
+결함이 확인됐다.** 현재 정규화 파이프라인(7절의 4개 패스)이 이 경로를 쓰지 않아 실사용 피해는
+없지만, `insert` 는 공개 API 라 외부 소비자가 지금 호출할 수 있다.
+
+- **합성 결과가 불변식 검사를 통과하지 못한다.** 앞 패스가 삽입한 문자를 뒤 패스가 흡수하면
+  양쪽이 모두 빈 퇴화 세그먼트가 남고, 그것이 `Insert` 로 분류되어 `validate` 가 거부한다
+- **합성 결합법칙이 깨진다.** `compose(compose(a, b), c)` 와 `compose(a, compose(b, c))` 가
+  둘 다 검사를 통과하면서도 세그먼트가 묶이는 굵기가 달라진다. 규칙 목록 정렬로 해결했던
+  것과 같은 종류의 순서 의존이 세그먼트 단위에 남아 있다
+
+레포 자체 테스트가 이것을 놓친 이유는 무작위 불변식 테스트의 연산 목록에 `insert` 가 없어
+해당 분기가 한 번도 실행되지 않았기 때문이다. **Python 바인딩은 이 경로를 노출하지 않는다.**
+정리 방향(제거 또는 수정)이 정해지면 무작위 테스트에 `insert` 를 넣어 함께 강제한다.
 
 ### 구현 전 검증이 필요한 사항
 
@@ -733,11 +868,11 @@ maturin develop --features python
 - **`LICENSE`** Apache-2.0
 - **`README.md`** 이 문서
 - **`.gitignore`**
-- `pyproject.toml` maturin 빌드 설정 (Python 바인딩 단계에서 생성)
+- **`pyproject.toml`** maturin 빌드 설정
 - **`src/`**
   - **`lib.rs`** 공개 API 진입점
   - **`error.rs`** `thiserror` 기반 단일 에러 열거형
-  - `python.rs` PyO3 바인딩
+  - **`python.rs`** PyO3 바인딩 (`--features python`)
   - **`span.rs`** `SpanMap`, `Segment`, `Span`, `SpanMapBuilder`, `compose`, `to_source`, `validate`
   - `normalize/`
     - `mod.rs` 파이프라인 조립
@@ -758,7 +893,9 @@ maturin develop --features python
   - `synth/` 합성 검증 데이터 생성기
   - `bin/`
     - `rpit.rs` 명령줄 도구
-- `tests/` 통합 테스트와 속성 테스트
+- **`tests/`**
+  - **`test_python_binding.py`** PyO3 바인딩 회귀 테스트 (pytest)
+  - 통합 테스트와 속성 테스트는 각 층이 들어올 때 함께 추가
 - `examples/` 사용 예제
 
 ---

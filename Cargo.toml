@@ -8,6 +8,10 @@ repository  = "https://github.com/arabangoo/rust_pii_transformer"
 readme      = "README.md"
 keywords    = ["pii", "korean", "masking", "privacy", "redaction"]
 categories  = ["text-processing"]
+# 기본 빌드가 실제로 요구하는 최소 버전(thiserror 2 의 1.71 이 상한).
+# feature = "python" 은 PyO3 0.29 때문에 1.83 이상이 필요하다. 옵트인 경로 하나 때문에
+# 코어 소비자 전체를 1.83 으로 올리지 않는다.
+rust-version = "1.71"
 
 # ── 독립성 원칙(README 3절·16절) ─────────────────────────────────
 # 기본 빌드 = pure Rust / zero FFI / zero subprocess / zero network.
@@ -22,13 +26,21 @@ crate-type = ["rlib", "cdylib"]
 # 코어(오프셋 매핑·정규화·탐지·마스킹)는 항상 빌드된다.
 default = []
 
+# Python 바인딩(PyO3 cdylib). abi3 휠 — `maturin develop --features python`.
+# serde_json 은 판정 결과를 Python 으로 내보내는 to_json 에만 쓰이므로 함께 옵트인이다.
+python = ["dep:pyo3", "dep:serde_json"]
+
 # 아래 feature 는 해당 코드가 실제로 들어오는 단계에서 함께 추가한다.
 # 데드 feature 를 미리 선언하지 않는다(형제 레포 rust_ocr_transformer 와 같은 규칙).
 #   hash   = ["dep:sha2", "dep:hmac"]   해시 가명화 마스킹 정책 (단계 6)
 #   synth  = ["dep:rand"]               합성 검증 데이터 생성기 (단계 4)
 #   cli    = ["dep:clap"]               명령줄 도구 rpit        (단계 7)
-#   python = ["dep:pyo3"]               PyO3 바인딩             (단계 7)
 
 [dependencies]
 thiserror = "2"
 serde     = { version = "1", features = ["derive"] }
+
+# ── Python 바인딩 (feature = "python") ──────────────────────────
+# abi3(안정 이진 인터페이스) 휠이라 Python 3.9 이상에서 휠 하나로 돈다.
+pyo3       = { version = "0.29", optional = true, features = ["extension-module", "abi3-py39"] }
+serde_json = { version = "1", optional = true }
