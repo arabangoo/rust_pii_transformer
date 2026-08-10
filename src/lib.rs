@@ -22,16 +22,16 @@
 //!
 //! ## 현재 구현 상태
 //!
-//! **1층(정규화)의 오프셋 매핑 자료구조만 구현돼 있다.** 정규화 패스, 탐지, 마스킹은 아직 없다.
-//! 진행 상황과 남은 범위는 저장소 `README.md` 의 개발 로드맵 절에 3단계
-//! (동작 확인 / 코드만 존재 / 미구현)로 기록한다.
+//! **2층(탐지)까지 구현돼 있다.** 마스킹과 합성 검증 코퍼스는 아직 없고, 그래서 재현율과
+//! 정밀도를 수치로 제시하지 못한다. 진행 상황과 남은 범위는 저장소 `README.md` 의 개발 로드맵
+//! 절에 3단계(동작 확인 / 코드만 존재 / 미구현)로 기록한다.
 //!
 //! | 모듈 | 상태 |
 //! | --- | --- |
 //! | [`span`] | 동작 확인. `SpanMap`, `Segment`, 합성, 역방향 매핑, 불변식 검사 |
+//! | [`normalize`] | 동작 확인. 4개 패스(자모 조합, 전각 폴딩, 한글 수사, 구분자 흡수)와 파이프라인 |
+//! | [`detect`] | 동작 확인. 검증식, 스캐너, 문맥 점수, 오케스트레이션. 정확도 수치는 미측정 |
 //! | `python` | 동작 확인. `span` 층의 PyO3 바인딩 (`--features python`) |
-//! | `normalize` | 미구현 |
-//! | `detect` | 미구현 |
 //! | `mask` | 미구현 |
 //! | `synth` | 미구현 |
 //!
@@ -55,7 +55,9 @@
 //! assert_eq!(source.cost.absorbed_separators, 1); // 판정 근거로 실린다
 //! ```
 
+pub mod detect;
 pub mod error;
+pub mod normalize;
 pub mod span;
 
 /// PyO3 바인딩. `--features python` 일 때만 빌드된다.
@@ -63,6 +65,7 @@ pub mod span;
 pub mod python;
 
 pub use error::{Error, Result};
+pub use normalize::{normalize, NormalizeConfig, Normalized, NumeralConfig};
 pub use span::{
     Absorbed, NormalizationCost, RuleId, Segment, SegmentKind, SourceSpan, Span, SpanMap,
     SpanMapBuilder,

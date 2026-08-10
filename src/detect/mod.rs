@@ -1,0 +1,507 @@
+//! 2층: 탐지.
+//!
+//! 정규화문 위에서 후보를 찾고, 검증식과 문맥으로 걸러 [`Finding`] 을 낸다. 스팬은
+//! [`crate::span::SpanMap`] 으로 원문 좌표에 되돌린 뒤 실린다.
+//!
+//! ```
+//! use rust_pii_transformer::detect::{detect, Config, Certainty, EntityKind};
+//!
+//! let text = "주민등록번호 팔팔공일공일 - 1234567 입니다";
+//! let report = detect(text, &Config::default()).unwrap();
+//!
+//! let finding = &report.findings[0];
+//! assert_eq!(finding.entity, EntityKind::Resident);
+//! // 한글 수사로 적힌 앞자리까지 원문 구간으로 되돌아온다.
+//! assert_eq!(finding.source.slice(text), "팔팔공일공일 - 1234567");
+//! assert_eq!(finding.evidence.cost.expanded_syllables, 6);
+//! assert!(finding.certainty >= Certainty::Probable);
+//! ```
+//!
+//! ## 점수 계산
+//!
+//! ```text
+//! 점수 = 패턴 기본점
+//!      + 검증식 통과 가산점
+//!      + 문맥 단서 가산점 (단서 무게와 거리 감쇠 반영)
+//!      - 정규화 비용 감점 (흡수 공백 > 흡수 구분자 > 확장 음절 > 치환 문자 순으로 무겁게)
+//! ```
+//!
+//! 감점이 있는 이유는 "정규화는 관대하게, 검증은 엄격하게" 원칙의 대가를 계량화하기 위해서다.
+//! 공백을 세 개 흡수해서 만들어진 숫자열은 원래부터 붙어 있던 숫자열보다 덜 믿을 만하다.
+
+pub mod checksum;
+pub mod context;
+pub mod entity;
+pub mod scanner;
+
+use serde::Serialize;
+
+pub use checksum::ChecksumResult;
+pub use context::ContextHit;
+pub use entity::{Candidate, Certainty, EntityKind};
+
+use crate::error::Result;
+use crate::normalize::{normalize, NormalizeConfig};
+use crate::span::{NormalizationCost, RuleId, Span};
+
+/// 점수 가중치. 모두 조정 가능하다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Weights {
+    /// 검증식 통과 가산점.
+    pub checksum_passed: f32,
+    /// 검증식 실패 감점. 버리지 않고 깎기만 한다.
+    pub checksum_failed: f32,
+    /// 문맥 단서 총점에 곱하는 계수.
+    pub context: f32,
+    /// 흡수한 공백 한 개당 감점. 없던 숫자열을 만들 수 있어 가장 무겁다.
+    pub absorbed_whitespace: f32,
+    /// 흡수한 구분자 한 개당 감점.
+    pub absorbed_separator: f32,
+    /// 숫자로 펼친 한글 음절 한 개당 감점.
+    pub expanded_syllable: f32,
+    /// 치환한 문자 한 개당 감점. 전각 폴딩은 값을 바꾸지 않아 가장 가볍다.
+    pub replaced_char: f32,
+}
+
+impl Default for Weights {
+    fn default() -> Self {
+        Self {
+            checksum_passed: 0.6,
+            checksum_failed: 0.25,
+            context: 0.5,
+            absorbed_whitespace: 0.08,
+            absorbed_separator: 0.01,
+            expanded_syllable: 0.01,
+            replaced_char: 0.002,
+        }
+    }
+}
+
+/// 탐지 설정.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Config {
+    /// 정규화 파이프라인 설정.
+    pub normalize: NormalizeConfig,
+    /// 문맥 단서를 찾을 창 크기(문자).
+    pub context_window: u32,
+    /// 이 점수 미만이면 결과로 내지 않는다.
+    pub min_score: f32,
+    /// 문맥이 필수인 엔티티가 요구하는 최소 문맥 총점.
+    pub min_context: f32,
+    /// 점수 가중치.
+    pub weights: Weights,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            normalize: NormalizeConfig::default(),
+            context_window: 24,
+            min_score: 0.5,
+            min_context: 0.3,
+            weights: Weights::default(),
+        }
+    }
+}
+
+/// 왜 이 후보가 걸렸는가.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Evidence {
+    /// 걸린 패턴 규칙 이름.
+    pub rule: &'static str,
+    /// 검증식 결과. 적용 불가면 그 사유까지 담는다.
+    pub checksum: ChecksumResult,
+    /// 잡힌 문맥 단서와 스팬으로부터의 거리.
+    pub context_hits: Vec<ContextHit>,
+    /// 이 스팬에 적용된 정규화 규칙 목록.
+    pub normalizations: Vec<RuleId>,
+    /// 정규화 비용. 감점 근거다.
+    pub cost: NormalizationCost,
+    /// 세그먼트 경계 바깥으로 넓혀졌는가.
+    pub snapped: bool,
+}
+
+/// 탐지 결과 한 건.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Finding {
+    /// 무슨 개인정보인가.
+    pub entity: EntityKind,
+    /// 원문 기준 스팬. 마스킹은 이 구간에 적용된다.
+    pub source: Span,
+    /// 정규화문 기준 스팬.
+    pub normalized: Span,
+    /// 판정 등급.
+    pub certainty: Certainty,
+    /// 연속 점수.
+    pub score: f32,
+    /// 판정 근거.
+    pub evidence: Evidence,
+}
+
+/// 왜 떨어졌는가.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RejectReason {
+    /// 검증식에서 떨어졌고 문맥도 부족했다.
+    ChecksumFailed,
+    /// 문맥이 필수인 엔티티인데 단서가 없었다.
+    NoContext,
+    /// 점수가 문턱에 못 미쳤다.
+    BelowThreshold,
+    /// 같은 구간에서 더 강한 후보에게 밀렸다.
+    Outranked,
+}
+
+/// 형식은 맞았는데 판정에서 떨어진 후보.
+///
+/// "검증되지 않은 개인정보가 지나갔다"는 의심을 조사할 때 필요하다.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Rejection {
+    /// 무슨 엔티티로 봤던 후보인가.
+    pub entity: EntityKind,
+    /// 원문 기준 스팬.
+    pub source: Span,
+    /// 떨어진 사유.
+    pub reason: RejectReason,
+    /// 그때의 점수.
+    pub score: f32,
+}
+
+/// 탐지 결과 전체.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Report {
+    /// 통과한 결과. 원문 위치 오름차순으로 정렬된다.
+    pub findings: Vec<Finding>,
+    /// 떨어진 후보. 왜 안 걸렸는지를 설명한다.
+    pub rejections: Vec<Rejection>,
+    /// 정규화된 텍스트. 판정 근거를 눈으로 확인할 때 쓴다.
+    pub normalized_text: String,
+}
+
+/// 텍스트에서 개인정보를 탐지한다.
+pub fn detect(text: &str, cfg: &Config) -> Result<Report> {
+    let normalized = normalize(text, &cfg.normalize)?;
+    let mut findings = Vec::new();
+    let mut rejections = Vec::new();
+
+    // 이메일은 숫자 런과 겹치지 않으므로 따로 모은다.
+    for span in scanner::emails(&normalized.text) {
+        let source = normalized.map.to_source(&span);
+        findings.push(Finding {
+            entity: EntityKind::Email,
+            source: source.span,
+            normalized: span,
+            certainty: Certainty::Probable,
+            score: 0.9,
+            evidence: Evidence {
+                rule: "email.structural",
+                checksum: ChecksumResult::NotApplicable("이메일에는 검증식이 없다"),
+                context_hits: Vec::new(),
+                normalizations: source.rules,
+                cost: source.cost,
+                snapped: source.snapped,
+            },
+        });
+    }
+
+    for span in scanner::digit_runs(&normalized.text) {
+        let digits = match checksum::to_digits(span.slice(&normalized.text)) {
+            Some(digits) => digits,
+            None => continue,
+        };
+        let source = normalized.map.to_source(&span);
+
+        let mut best: Option<(Finding, f32)> = None;
+        let mut local_rejections = Vec::new();
+
+        for candidate in entity::candidates(&digits) {
+            let hits = context::find(&normalized.text, &span, cfg.context_window, candidate.cues);
+            let context_total = context::total(&hits);
+
+            let evaluated = evaluate(&candidate, context_total, &source.cost, &cfg.weights);
+
+            let reason = if candidate.needs_context && context_total < cfg.min_context {
+                Some(RejectReason::NoContext)
+            } else if evaluated.score < cfg.min_score {
+                Some(if candidate.checksum.failed() {
+                    RejectReason::ChecksumFailed
+                } else {
+                    RejectReason::BelowThreshold
+                })
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
+                local_rejections.push(Rejection {
+                    entity: candidate.entity,
+                    source: source.span.clone(),
+                    reason,
+                    score: evaluated.score,
+                });
+                continue;
+            }
+
+            let finding = Finding {
+                entity: candidate.entity,
+                source: source.span.clone(),
+                normalized: span.clone(),
+                certainty: evaluated.certainty,
+                score: evaluated.score,
+                evidence: Evidence {
+                    rule: candidate.rule,
+                    checksum: candidate.checksum,
+                    context_hits: hits,
+                    normalizations: source.rules.clone(),
+                    cost: source.cost,
+                    snapped: source.snapped,
+                },
+            };
+
+            let wins = best
+                .as_ref()
+                .map_or(true, |(_, best_score)| evaluated.score > *best_score);
+            if wins {
+                // 밀려난 이전 최고 후보도 왜 안 나왔는지 남긴다.
+                if let Some((previous, score)) = best.replace((finding, evaluated.score)) {
+                    local_rejections.push(Rejection {
+                        entity: previous.entity,
+                        source: previous.source,
+                        reason: RejectReason::Outranked,
+                        score,
+                    });
+                }
+            } else {
+                local_rejections.push(Rejection {
+                    entity: candidate.entity,
+                    source: source.span.clone(),
+                    reason: RejectReason::Outranked,
+                    score: evaluated.score,
+                });
+            }
+        }
+
+        if let Some((finding, _)) = best {
+            findings.push(finding);
+        }
+        rejections.append(&mut local_rejections);
+    }
+
+    findings.sort_by_key(|f| (f.source.byte.start, f.source.byte.end));
+    rejections.sort_by_key(|r| (r.source.byte.start, r.source.byte.end));
+
+    Ok(Report {
+        findings,
+        rejections,
+        normalized_text: normalized.text,
+    })
+}
+
+struct Evaluated {
+    score: f32,
+    certainty: Certainty,
+}
+
+/// 후보 하나의 점수와 등급을 낸다.
+fn evaluate(
+    candidate: &Candidate,
+    context_total: f32,
+    cost: &NormalizationCost,
+    weights: &Weights,
+) -> Evaluated {
+    let mut score = candidate.base;
+
+    if candidate.checksum.passed() {
+        score += weights.checksum_passed;
+    } else if candidate.checksum.failed() {
+        score -= weights.checksum_failed;
+    }
+    score += context_total * weights.context;
+
+    score -= f32::from(cost.absorbed_whitespace) * weights.absorbed_whitespace;
+    score -= f32::from(cost.absorbed_separators) * weights.absorbed_separator;
+    score -= f32::from(cost.expanded_syllables) * weights.expanded_syllable;
+    score -= f32::from(cost.replaced_chars) * weights.replaced_char;
+
+    let certainty = if candidate.checksum.passed() {
+        Certainty::Certain
+    } else if context_total > 0.0 {
+        Certainty::Probable
+    } else {
+        Certainty::Possible
+    };
+
+    Evaluated {
+        score: score.clamp(0.0, 2.0),
+        // 검증식이 없거나 공개되지 않은 엔티티는 천장을 넘을 수 없다.
+        certainty: certainty.min(candidate.ceiling),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(text: &str) -> Report {
+        detect(text, &Config::default()).unwrap()
+    }
+
+    fn entities(report: &Report) -> Vec<EntityKind> {
+        report.findings.iter().map(|f| f.entity).collect()
+    }
+
+    #[test]
+    fn finds_a_resident_number_written_in_hangul_numerals() {
+        let text = "주민등록번호 팔팔공일공일 - 1234567 입니다";
+        let report = run(text);
+        assert_eq!(entities(&report), vec![EntityKind::Resident]);
+
+        let finding = &report.findings[0];
+        assert_eq!(finding.source.slice(text), "팔팔공일공일 - 1234567");
+        assert_eq!(finding.evidence.cost.expanded_syllables, 6);
+        assert_eq!(finding.evidence.cost.absorbed_whitespace, 2);
+        assert!(finding.evidence.context_hits.iter().any(|h| h.cue == "주민등록번호"));
+    }
+
+    #[test]
+    fn finds_a_card_number_without_any_context() {
+        // Luhn 은 국제 표준이라 문맥이 없어도 확실하다.
+        let report = run("4111-1111-1111-1111");
+        assert_eq!(entities(&report), vec![EntityKind::CreditCard]);
+        assert_eq!(report.findings[0].certainty, Certainty::Certain);
+    }
+
+    #[test]
+    fn finds_a_business_number() {
+        let report = run("사업자등록번호 124-81-00998");
+        assert_eq!(entities(&report), vec![EntityKind::BusinessRegistration]);
+        assert_eq!(report.findings[0].certainty, Certainty::Certain);
+    }
+
+    #[test]
+    fn finds_a_phone_number() {
+        let report = run("연락처는 010-1234-5678 입니다");
+        assert_eq!(entities(&report), vec![EntityKind::Phone]);
+        assert_eq!(
+            report.findings[0].certainty,
+            Certainty::Probable,
+            "전화번호는 검증식이 없어 천장이 Probable 이다"
+        );
+    }
+
+    #[test]
+    fn finds_an_email() {
+        let report = run("메일은 minsu.kim@example.com 입니다");
+        assert_eq!(entities(&report), vec![EntityKind::Email]);
+    }
+
+    #[test]
+    fn finds_a_foreigner_registration_number() {
+        let report = run("외국인등록번호 880101-5234567");
+        assert_eq!(entities(&report), vec![EntityKind::ForeignerRegistration]);
+    }
+
+    #[test]
+    fn account_number_needs_context() {
+        // 문맥이 없으면 계좌번호로 보지 않는다. 이 라이브러리의 오탐 억제 핵심이다.
+        let bare = run("접수번호 1234567890123 입니다");
+        assert!(!entities(&bare).contains(&EntityKind::BankAccount));
+        assert!(bare
+            .rejections
+            .iter()
+            .any(|r| r.entity == EntityKind::BankAccount && r.reason == RejectReason::NoContext));
+
+        let with_context = run("입금 계좌번호 1234567890123 로 보내주세요");
+        assert!(entities(&with_context).contains(&EntityKind::BankAccount));
+    }
+
+    #[test]
+    fn resident_number_with_a_valid_checksum_reaches_certain() {
+        // 880101-1234568 은 검증식을 만족한다(계산으로 확인한 값이다).
+        let report = run("주민등록번호 880101-1234568 입니다");
+        let finding = &report.findings[0];
+        assert_eq!(finding.entity, EntityKind::Resident);
+        assert!(finding.evidence.checksum.passed());
+        assert_eq!(finding.certainty, Certainty::Certain);
+    }
+
+    #[test]
+    fn resident_number_survives_a_failed_checksum_when_context_is_strong() {
+        // 2020년 10월 이후 발급분은 검증식이 성립하지 않는다. 검증 실패를 버리는 근거가 아니라
+        // 등급을 낮추는 근거로만 쓴다. 이것이 이 라이브러리의 핵심 판단 중 하나다.
+        let report = run("주민등록번호 880101-1234567 입니다");
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.entity == EntityKind::Resident)
+            .expect("검증식이 떨어져도 문맥이 있으면 살아야 한다");
+        assert!(finding.evidence.checksum.failed());
+        assert_eq!(finding.certainty, Certainty::Probable);
+    }
+
+    #[test]
+    fn plain_text_yields_nothing() {
+        let report = run("이번 분기 실적은 전년 대비 개선되었습니다. 자세한 내용은 보고서를 참고하세요.");
+        assert!(report.findings.is_empty());
+        assert!(report.rejections.is_empty());
+    }
+
+    #[test]
+    fn order_numbers_are_not_flagged() {
+        for text in [
+            "주문번호 20240115003 로 접수되었습니다",
+            "제품 코드 1234 수량 5678 개",
+            "송장번호 987654321098 입니다",
+        ] {
+            let report = run(text);
+            assert!(
+                report.findings.is_empty(),
+                "오탐이 났다: {text} -> {:?}",
+                entities(&report)
+            );
+        }
+    }
+
+    #[test]
+    fn rejections_explain_why_a_candidate_was_dropped() {
+        let report = run("접수번호 1234567890123 입니다");
+        assert!(!report.rejections.is_empty(), "떨어진 이유가 남아야 한다");
+        for rejection in &report.rejections {
+            assert!(rejection.score >= 0.0);
+        }
+    }
+
+    #[test]
+    fn findings_are_sorted_by_position() {
+        let text = "카드 4111-1111-1111-1111 이고 연락처 010-1234-5678 이며 메일 a@b.com";
+        let report = run(text);
+        for pair in report.findings.windows(2) {
+            assert!(pair[0].source.byte.start <= pair[1].source.byte.start);
+        }
+        assert_eq!(report.findings.len(), 3);
+    }
+
+    #[test]
+    fn fullwidth_digits_are_detected() {
+        let report = run("카드번호 ４１１１１１１１１１１１１１１１");
+        assert_eq!(entities(&report), vec![EntityKind::CreditCard]);
+        assert!(report.findings[0].evidence.cost.replaced_chars > 0);
+    }
+
+    #[test]
+    fn one_span_yields_at_most_one_finding() {
+        // 열세 자리는 주민등록번호이자 카드번호 후보다. 하나만 남아야 한다.
+        let report = run("주민등록번호 8801011234567");
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].entity, EntityKind::Resident);
+    }
+
+    #[test]
+    fn thresholds_are_configurable() {
+        let strict = Config {
+            min_score: 1.5,
+            ..Default::default()
+        };
+        let report = detect("연락처는 010-1234-5678 입니다", &strict).unwrap();
+        assert!(report.findings.is_empty(), "문턱을 올리면 걸러진다");
+    }
+}
