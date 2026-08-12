@@ -7,13 +7,19 @@
 //! 이 모듈은 판정하지 않는다. 후보와 그 후보의 검증 결과, 그리고 **그 엔티티가 도달할 수 있는
 //! 최고 등급**까지만 낸다. 점수 계산과 최종 판정은 [`super`] 의 오케스트레이션이 한다.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::checksum::{self, ChecksumResult};
 use super::context::{self, Cue};
 
 /// 이 라이브러리가 다루는 개인정보 종류.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+///
+/// 이 열거형만 `Deserialize` 도 유도한다. 필드가 없어 수명 문제가 없고, 복원 맵을 파일로
+/// 저장했다가 다시 읽어야 마스킹의 가역성이 프로세스 경계를 넘어 성립하기 때문이다.
+/// JSON 이름은 소문자 스네이크 케이스다. Python 바인딩과 명령줄 도구가 내는 이름,
+/// 그리고 직렬화 결과가 서로 달라지면 같은 값에 이름이 둘 생긴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     /// 주민등록번호.
     Resident,
@@ -36,7 +42,10 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    /// 사람이 읽는 이름. 마스킹 자리표시자에 쓴다.
+    /// 사람이 읽는 한국어 이름. `"주민등록번호"`
+    ///
+    /// 한국어 문서를 다루는 한국어 사용자를 위한 이름이다. 영문 산출물에 쓸 이름은
+    /// [`EntityKind::code_upper`] 다.
     pub fn label(&self) -> &'static str {
         match self {
             EntityKind::Resident => "주민등록번호",
@@ -50,10 +59,69 @@ impl EntityKind {
             EntityKind::BirthDate => "생년월일",
         }
     }
+
+    /// 기계용 소문자 식별자. `"credit_card"`
+    ///
+    /// **이 이름 하나가 JSON 직렬화 이름이자 Python 속성값이자 명령줄 출력값이다.**
+    /// 같은 값에 이름이 여럿 생기지 않도록 한 곳에서만 정한다. 직렬화 이름과 어긋나지
+    /// 않는지는 단위 테스트가 검사한다.
+    pub fn code(&self) -> &'static str {
+        match self {
+            EntityKind::Resident => "resident",
+            EntityKind::ForeignerRegistration => "foreigner_registration",
+            EntityKind::BusinessRegistration => "business_registration",
+            EntityKind::CreditCard => "credit_card",
+            EntityKind::BankAccount => "bank_account",
+            EntityKind::Phone => "phone",
+            EntityKind::Email => "email",
+            EntityKind::DriverLicense => "driver_license",
+            EntityKind::BirthDate => "birth_date",
+        }
+    }
+
+    /// 영문 대문자 이름. `"CREDIT_CARD"`
+    ///
+    /// 한국어 자리표시자가 문서를 오염시키면 안 되는 경우를 위한 것이다. 한국어 문서를
+    /// 다루는 비한국어 사용자가 실제 사용자층이고, 그들의 산출물에 `[카드번호]` 가 박히면
+    /// 곤란하다. [`code`](EntityKind::code) 의 대문자형이라 새로 외울 이름이 늘지 않는다.
+    pub fn code_upper(&self) -> &'static str {
+        match self {
+            EntityKind::Resident => "RESIDENT",
+            EntityKind::ForeignerRegistration => "FOREIGNER_REGISTRATION",
+            EntityKind::BusinessRegistration => "BUSINESS_REGISTRATION",
+            EntityKind::CreditCard => "CREDIT_CARD",
+            EntityKind::BankAccount => "BANK_ACCOUNT",
+            EntityKind::Phone => "PHONE",
+            EntityKind::Email => "EMAIL",
+            EntityKind::DriverLicense => "DRIVER_LICENSE",
+            EntityKind::BirthDate => "BIRTH_DATE",
+        }
+    }
+
+    /// 소문자 식별자로 되찾는다. 모르는 이름이면 `None`.
+    pub fn from_code(code: &str) -> Option<Self> {
+        ALL.iter().copied().find(|kind| kind.code() == code)
+    }
 }
+
+/// 이 라이브러리가 다루는 엔티티 전부. 새 엔티티를 넣으면 여기에도 넣어야 한다.
+///
+/// 목록 자체를 테스트가 검사하므로 빠뜨리면 걸린다.
+pub const ALL: &[EntityKind] = &[
+    EntityKind::Resident,
+    EntityKind::ForeignerRegistration,
+    EntityKind::BusinessRegistration,
+    EntityKind::CreditCard,
+    EntityKind::BankAccount,
+    EntityKind::Phone,
+    EntityKind::Email,
+    EntityKind::DriverLicense,
+    EntityKind::BirthDate,
+];
 
 /// 판정 등급.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Certainty {
     /// 형식만 맞다. 문맥 단서가 없다.
     Possible,
@@ -169,6 +237,15 @@ pub fn candidates(digits: &[u8]) -> Vec<Candidate> {
     }
 
     // 전화번호. 식별번호로 형태를 가른다.
+    //
+    // 기본점이 0.6 인 이유는 문턱과의 여유 때문이다. 전화번호는 검증식이 없고 문맥도 필수가
+    // 아니라, **기본점 하나로 문턱을 넘어야 하는 유일한 엔티티**다. 기본점을 문턱과 같은 0.5 로
+    // 두면 하이픈 두 개(감점 0.02)나 전각 열한 자(감점 0.022)만 있어도 문턱 아래로 떨어져,
+    // 한국에서 가장 흔한 표기인 `010-1234-5678` 이 문맥 없이는 안 잡힌다. 합성 코퍼스 실측에서
+    // 전화번호 재현율이 66.7퍼센트로 나와 드러난 결함이고, 여유 0.1 을 줘서 고쳤다.
+    //
+    // 일반화하면 이렇다. **문맥이 필수가 아니고 검증식도 없는 엔티티의 기본점은 문턱보다
+    // 정규화 비용의 통상 범위만큼 높아야 한다.** 같으면 정규화가 판정을 뒤집는다.
     if let Some(rule) = phone_rule(&text) {
         out.push(Candidate {
             entity: EntityKind::Phone,
@@ -176,7 +253,7 @@ pub fn candidates(digits: &[u8]) -> Vec<Candidate> {
             checksum: ChecksumResult::NotApplicable("전화번호에는 검증식이 없다"),
             ceiling: Certainty::Probable,
             cues: context::PHONE,
-            base: 0.5,
+            base: 0.6,
             needs_context: false,
         });
     }
@@ -283,6 +360,49 @@ mod tests {
 
     fn digits(s: &str) -> Vec<u8> {
         checksum::to_digits(s).unwrap()
+    }
+
+    /// 한 값에 이름이 여럿 생기지 않게 고정한다.
+    ///
+    /// `code()` 는 손으로 적은 표이고 직렬화 이름은 파생 매크로가 만든다. 둘이 갈라지면
+    /// JSON 과 Python 속성이 서로 다른 이름을 내게 된다. 실제로 한 번 그렇게 됐었다.
+    #[test]
+    fn code_matches_the_serialized_name_for_every_entity() {
+        for kind in ALL {
+            let json = serde_json::to_string(kind).unwrap();
+            let serialized = json.trim_matches('"');
+            assert_eq!(kind.code(), serialized, "{kind:?} 의 code 와 직렬화 이름이 다르다");
+        }
+    }
+
+    #[test]
+    fn code_upper_is_the_uppercase_of_code() {
+        for kind in ALL {
+            assert_eq!(
+                kind.code_upper(),
+                kind.code().to_uppercase(),
+                "{kind:?} 의 두 이름이 갈라졌다"
+            );
+        }
+    }
+
+    #[test]
+    fn every_entity_has_all_three_names_and_round_trips() {
+        for kind in ALL {
+            assert!(!kind.label().is_empty());
+            assert!(kind.code_upper().is_ascii(), "{kind:?} 의 영문 이름에 비아스키가 있다");
+            assert_eq!(EntityKind::from_code(kind.code()), Some(*kind));
+        }
+        assert_eq!(EntityKind::from_code("nope"), None);
+    }
+
+    #[test]
+    fn the_all_list_has_no_duplicates() {
+        let mut codes: Vec<&str> = ALL.iter().map(|k| k.code()).collect();
+        let total = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), total, "ALL 에 중복이 있다");
     }
 
     fn kinds(s: &str) -> Vec<EntityKind> {

@@ -93,6 +93,7 @@ impl Span {
 
 /// 세그먼트 한 조각이 무슨 변환인가.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SegmentKind {
     /// 원문 그대로 통과.
     Identity,
@@ -102,12 +103,21 @@ pub enum SegmentKind {
     Delete,
     /// 정규화문이 더 길다. 한글 수사를 숫자로 펼친 경우.
     Expand,
-    /// 원문에 대응이 없다. 현재 정규화 파이프라인은 쓰지 않고 확장 대비로 둔다.
-    Insert,
 }
+
+// 삽입(원문에 대응이 없는 문자를 끼워 넣는 것)은 이 자료구조가 지원하지 않는다.
+//
+// 처음에는 확장 대비로 두었으나 실측으로 원리적 충돌이 드러나 걷어냈다. 정규화 비용은
+// **원문을 기준으로** 정의되는데, 끼워 넣은 문자에는 대응하는 원문이 없다. 앞 패스가 넣은
+// 문자를 뒤 패스가 흡수하면 양쪽이 모두 빈 조각이 남고, 그 조각의 비용을 어느 원문 구간에
+// 매길지 결정할 방법이 없다. 합성을 어느 순서로 묶느냐에 따라 비용이 달라져 결정성이 깨졌다.
+//
+// 정규화 패스가 문자를 끼워 넣을 이유도 없다. 네 패스는 모두 통과·치환·펼침·흡수뿐이다.
+// 쓰지도 않는 경로를 위해 비용 모델을 흐리지 않는다.
 
 /// 삭제된 원문 조각의 종류. 신뢰도 감점 계수가 종류마다 다르다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Absorbed {
     /// 공백. 없던 숫자열을 만들 수 있어 가장 위험하다.
     Whitespace,
@@ -355,19 +365,11 @@ impl SpanMap {
                 continue;
             }
 
-            // B 폭이 0인 outer 세그먼트(정규화문에만 있는 것).
+            // 원문 쪽이 빈 세그먼트는 존재할 수 없다(삽입 미지원). 만들어졌다면 손상된 표다.
             if j < no && outer.segments[j].src.is_empty() {
-                let seg = &outer.segments[j];
-                let (ab, ac) = inner.backward_point(i, bb, bc)?;
-                out.push(Segment {
-                    src: Span::empty_at(ab, ac),
-                    dst: seg.dst.clone(),
-                    kind: SegmentKind::Insert,
-                    rules: seg.rules.clone(),
-                    cost: seg.cost,
-                });
-                j += 1;
-                continue;
+                return Err(Error::mismatch(format!(
+                    "outer segment {j} has an empty source range; insertion is not supported"
+                )));
             }
 
             if i >= ni || j >= no {
@@ -437,6 +439,7 @@ impl SpanMap {
 
             let src = Span::new(ab0..ab1, ac0..ac1);
             let dst = Span::new(cb0..cb1, cc0..cc1);
+
             let kind = if all_identity {
                 SegmentKind::Identity
             } else {
@@ -501,11 +504,6 @@ impl SpanMap {
                         return Err(Error::invariant(index, "delete segment must consume src and produce nothing"));
                     }
                 }
-                SegmentKind::Insert => {
-                    if !seg.src.is_empty() || seg.dst.is_empty() {
-                        return Err(Error::invariant(index, "insert segment must produce dst from nothing"));
-                    }
-                }
                 SegmentKind::Expand => {
                     if seg.dst.char_len() <= seg.src.char_len() {
                         return Err(Error::invariant(index, "expand segment must grow in chars"));
@@ -516,6 +514,14 @@ impl SpanMap {
                         return Err(Error::invariant(index, "replace segment must have both sides"));
                     }
                 }
+            }
+
+            // 삽입은 지원하지 않으므로 원문 쪽이 빈 세그먼트는 어떤 종류로도 존재할 수 없다.
+            if seg.src.is_empty() {
+                return Err(Error::invariant(
+                    index,
+                    "segment has an empty source range; insertion is not supported",
+                ));
             }
 
             sb = seg.src.byte.end;
@@ -631,7 +637,8 @@ impl SpanMapBuilder {
 
     /// 문자 폴딩. 전각을 반각으로 바꾸거나 유사문자를 교정할 때 쓴다.
     pub fn replace(&mut self, src_text: &str, dst_text: &str, rule: RuleId) {
-        if src_text.is_empty() && dst_text.is_empty() {
+        // 원문 조각이 비면 삽입이 되는데 그것은 지원하지 않는다. 조용히 넘긴다.
+        if src_text.is_empty() {
             return;
         }
         let src = self.advance_src(src_text);
@@ -648,7 +655,8 @@ impl SpanMapBuilder {
     /// 결과가 짧아지는 경우(`구십일` → `91`)도 있으므로 종류는 길이로 판정하고,
     /// 비용은 소비한 한글 음절 수로 센다.
     pub fn numeral(&mut self, src_text: &str, dst_text: &str, rule: RuleId) {
-        if src_text.is_empty() && dst_text.is_empty() {
+        // 원문 조각이 비면 삽입이 되는데 그것은 지원하지 않는다. 조용히 넘긴다.
+        if src_text.is_empty() {
             return;
         }
         let src = self.advance_src(src_text);
@@ -674,16 +682,6 @@ impl SpanMapBuilder {
             Absorbed::Other => NormalizationCost::default(),
         };
         self.push_transform(src, dst, rule, cost);
-    }
-
-    /// 원문에 대응이 없는 문자열을 끼워 넣는다. 현재 파이프라인은 쓰지 않고 확장 대비로 둔다.
-    pub fn insert(&mut self, dst_text: &str, rule: RuleId) {
-        if dst_text.is_empty() {
-            return;
-        }
-        let src = Span::empty_at(self.src_byte, self.src_char);
-        let dst = self.advance_dst(dst_text);
-        self.push_transform(src, dst, rule, NormalizationCost::default());
     }
 
     /// 정규화 결과 문자열과 매핑을 낸다.
@@ -714,10 +712,10 @@ impl SpanMapBuilder {
 
 // ── 내부 헬퍼 ────────────────────────────────────────────────
 
+/// 양쪽 길이로 세그먼트 종류를 정한다. 원문 쪽은 항상 비어 있지 않다(삽입 미지원).
 fn classify(src: &Span, dst: &Span) -> SegmentKind {
-    if src.is_empty() {
-        SegmentKind::Insert
-    } else if dst.is_empty() {
+    debug_assert!(!src.is_empty(), "삽입은 지원하지 않는다");
+    if dst.is_empty() {
         SegmentKind::Delete
     } else if dst.char_len() > src.char_len() {
         SegmentKind::Expand
@@ -1122,11 +1120,14 @@ mod tests {
         while k < chars.len() {
             let take = (1 + rng.below(3)).min(chars.len() - k);
             let piece: String = chars[k..k + take].iter().collect();
+            // 빌더가 낼 수 있는 모든 연산이 여기 있어야 한다. 목록에서 빠진 분기는 한 번도
+            // 실행되지 않고, 실행되지 않은 경로의 결함은 실사용에서 처음 드러난다.
             match rng.below(6) {
                 0 => b.absorb(&piece, R_SEP, Absorbed::Separator),
                 1 => b.absorb(&piece, R_SEP, Absorbed::Whitespace),
                 2 => b.replace(&piece, "X", R_FOLD),
                 3 => b.numeral(&piece, "123", R_NUM),
+                4 => b.numeral(&piece, "1234567", R_NUM),
                 _ => b.keep(&piece),
             }
             k += take;

@@ -140,6 +140,7 @@ pub struct Finding {
 
 /// 왜 떨어졌는가.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RejectReason {
     /// 검증식에서 떨어졌고 문맥도 부족했다.
     ChecksumFailed,
@@ -388,6 +389,41 @@ mod tests {
         );
     }
 
+    /// 회귀 테스트. 문맥 없는 하이픈·전각 전화번호가 문턱에서 떨어지던 결함을 막는다.
+    ///
+    /// 기본점이 문턱과 같으면 정규화 비용이 판정을 뒤집는다. 합성 코퍼스 실측에서 전화번호
+    /// 재현율 66.7퍼센트로 드러났고, 미탐이 전부 이 두 표기였다.
+    #[test]
+    fn a_bare_phone_number_survives_hyphen_and_fullwidth_cost() {
+        for text in ["010-1234-5678", "01012345678", "０１０１２３４５６７８"] {
+            let report = run(text);
+            assert_eq!(
+                entities(&report),
+                vec![EntityKind::Phone],
+                "문맥 없는 전화번호를 놓쳤다: {text}"
+            );
+        }
+    }
+
+    /// 공백으로 끊은 전화번호는 문맥이 있어야 잡힌다. **결함이 아니라 설계된 경계다.**
+    ///
+    /// 공백 흡수는 감점이 가장 무겁다(하이픈의 여덟 배). 없던 숫자열을 만들어 내는 유일한
+    /// 정규화이기 때문이다. 문맥 없이 공백 표기까지 잡으려면 그 장치를 풀어야 하고, 그러면
+    /// 세 덩어리로 떨어져 있던 숫자가 우연히 식별번호로 시작하는 순간 전부 전화번호가 된다.
+    /// 여기서는 재현율보다 정밀도를 택했다.
+    #[test]
+    fn a_space_separated_phone_number_needs_context() {
+        assert!(
+            entities(&run("010 1234 5678")).is_empty(),
+            "문맥 없는 공백 표기는 의도적으로 버린다"
+        );
+        assert_eq!(
+            entities(&run("연락처는 010 1234 5678 입니다")),
+            vec![EntityKind::Phone],
+            "문맥이 있으면 공백 표기도 잡아야 한다"
+        );
+    }
+
     #[test]
     fn finds_an_email() {
         let report = run("메일은 minsu.kim@example.com 입니다");
@@ -493,6 +529,26 @@ mod tests {
         let report = run("주민등록번호 8801011234567");
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].entity, EntityKind::Resident);
+    }
+
+    /// 회귀 테스트. 같은 값에 이름이 둘 생기던 결함을 막는다.
+    ///
+    /// Python 바인딩과 명령줄 도구는 엔티티를 `"resident"` 로 부르는데 JSON 직렬화는
+    /// `"Resident"` 를 내고 있었다. 어느 문으로 들어오느냐에 따라 이름이 달라지면
+    /// 소비자가 두 이름을 다 알아야 한다.
+    #[test]
+    fn json_names_match_the_names_the_api_reports() {
+        let report = run("주민등록번호 880101-1234568 이고 연락처 010-1234-5678");
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(json.contains(r#""entity":"resident""#), "{json}");
+        assert!(json.contains(r#""entity":"phone""#), "{json}");
+        assert!(json.contains(r#""certainty":"certain""#), "{json}");
+        assert!(json.contains(r#""checksum":"passed""#), "{json}");
+        assert!(
+            !json.contains(r#""Resident""#) && !json.contains(r#""Certain""#),
+            "파스칼 케이스 이름이 남아 있다: {json}"
+        );
     }
 
     #[test]

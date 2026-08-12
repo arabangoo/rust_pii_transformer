@@ -57,14 +57,17 @@
 
 pub mod detect;
 pub mod error;
+pub mod mask;
 pub mod normalize;
 pub mod span;
+pub mod synth;
 
 /// PyO3 바인딩. `--features python` 일 때만 빌드된다.
 #[cfg(feature = "python")]
 pub mod python;
 
 pub use error::{Error, Result};
+pub use mask::{mask, unmask, MaskOutput, Policy, PolicySet, Redaction, RestoreMap};
 pub use normalize::{normalize, NormalizeConfig, Normalized, NumeralConfig};
 pub use span::{
     Absorbed, NormalizationCost, RuleId, Segment, SegmentKind, SourceSpan, Span, SpanMap,

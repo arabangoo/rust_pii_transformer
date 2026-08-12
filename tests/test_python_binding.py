@@ -31,18 +31,18 @@ rpit = pytest.importorskip(
 
 def test_module_metadata():
     assert rpit.__version__
-    # 현재 범위를 감추지 않는다. 탐지·마스킹 층이 들어오면 이 문자열도 함께 바뀐다.
-    assert "span layer only" in rpit.__status__
+    # 현재 범위를 감추지 않는다. 층이 바뀌면 이 문자열도 함께 바뀐다.
+    assert "detect" in rpit.__status__ and "mask" in rpit.__status__
+    assert isinstance(rpit.__has_hash_policy__, bool)
 
 
-def test_unimplemented_layers_are_absent_not_stubbed():
-    # 던지기만 하는 껍데기를 미리 노출하지 않는다. 없으면 없는 것이다.
-    for name in ("detect", "mask", "unmask"):
-        assert not hasattr(rpit, name), "%s 가 껍데기로 노출됐다" % name
+def test_all_four_layers_are_exposed():
+    for name in ("normalize", "detect", "mask", "unmask", "entity_names"):
+        assert hasattr(rpit, name), "%s 가 노출되지 않았다" % name
 
 
-def test_defective_insert_path_is_not_exposed():
-    # compose 시 불변식·결합법칙이 깨지는 것이 실측된 경로다. 정리 전까지 노출하지 않는다.
+def test_insert_is_not_exposed_because_the_core_removed_it():
+    # 코어에서 삽입 연산 자체를 걷어냈다. 정규화 비용을 원문 기준으로 매길 수 없기 때문이다.
     assert not hasattr(rpit.SpanMapBuilder(), "insert")
 
 
@@ -275,3 +275,211 @@ def test_char_range_out_of_range_raises():
 def test_reversed_char_range_raises():
     with pytest.raises(ValueError):
         rpit.Span.from_char_range("abcdef", 4, 2)
+
+
+# ── 탐지 층 ──────────────────────────────────────────────────
+
+
+TEXT = "주민등록번호 팔팔공일공일 - 1234567 이고 연락처는 010-1234-5678 입니다"
+
+
+def test_detect_finds_a_hangul_numeral_resident_number():
+    """이 라이브러리가 존재하는 이유. 한글 수사로 적힌 번호가 원문 좌표로 되돌아온다."""
+    report = rpit.detect(TEXT)
+    kinds = [f.entity for f in report.findings]
+    assert "resident" in kinds
+    assert "phone" in kinds
+
+    rrn = next(f for f in report.findings if f.entity == "resident")
+    assert rrn.text(TEXT) == "팔팔공일공일 - 1234567"
+    assert rrn.entity_label == "주민등록번호"
+    assert rrn.evidence.cost.expanded_syllables == 6
+    assert any(h.cue == "주민등록번호" for h in rrn.evidence.context_hits)
+
+
+def test_finding_reports_both_byte_and_char_offsets():
+    report = rpit.detect(TEXT)
+    f = report.findings[0]
+    # 한글이 앞에 있으므로 바이트와 문자 좌표가 달라야 한다.
+    assert f.source.byte_start != f.source.char_start
+    assert TEXT[f.source.char_start:f.source.char_end] == f.text(TEXT)
+
+
+def test_certainty_and_checksum_are_lowercase_strings():
+    report = rpit.detect("카드번호 4111-1111-1111-1111")
+    f = report.findings[0]
+    assert f.entity == "credit_card"
+    assert f.certainty == "certain"
+    assert f.evidence.checksum == "passed"
+    assert f.evidence.checksum_reason is None
+
+
+def test_checksum_reason_is_given_when_not_applicable():
+    report = rpit.detect("연락처는 010-1234-5678 입니다")
+    f = report.findings[0]
+    assert f.evidence.checksum == "not_applicable"
+    assert f.evidence.checksum_reason
+
+
+def test_rejections_explain_why_a_candidate_was_dropped():
+    report = rpit.detect("접수번호 1234567890123 입니다")
+    assert not report.findings
+    reasons = {r.entity: r.reason for r in report.rejections}
+    assert reasons["bank_account"] == "no_context"
+
+
+def test_json_names_match_the_attribute_names():
+    """같은 값에 이름이 둘 생기면 안 된다."""
+    report = rpit.detect("주민등록번호 880101-1234568")
+    f = report.findings[0]
+    payload = json.loads(f.to_json())
+    assert payload["entity"] == f.entity == "resident"
+    assert payload["certainty"] == f.certainty
+    assert payload["evidence"]["checksum"] == f.evidence.checksum
+
+
+def test_entity_names_lists_every_kind():
+    names = rpit.entity_names()
+    assert "resident" in names and "bank_account" in names
+    assert len(names) == 9
+
+
+# ── 설정 ─────────────────────────────────────────────────────
+
+
+def test_raising_the_threshold_filters_results():
+    cfg = rpit.Config()
+    cfg.min_score = 1.5
+    assert len(rpit.detect("연락처는 010-1234-5678 입니다", cfg)) == 0
+
+
+def test_turning_off_the_hangul_pass_loses_hangul_numerals():
+    cfg = rpit.Config()
+    cfg.hangul = False
+    assert len(rpit.detect("주민등록번호 팔팔공일공일-1234567", cfg)) == 0
+
+
+def test_weights_are_readable_and_settable():
+    cfg = rpit.Config()
+    before = dict(cfg.weights)
+    assert "checksum_passed" in before
+    cfg.set_weights(context=0.9)
+    assert dict(cfg.weights)["context"] == pytest.approx(0.9)
+    # 주지 않은 값은 그대로다.
+    assert dict(cfg.weights)["checksum_passed"] == pytest.approx(before["checksum_passed"])
+
+
+def test_normalize_can_be_used_alone():
+    out = rpit.normalize("주민등록번호 팔팔공일공일-1234567")
+    assert out.text == "주민등록번호 8801011234567"
+    out.map.validate()
+
+
+# ── 마스킹 층 ────────────────────────────────────────────────
+
+
+def test_default_policy_names_what_was_removed():
+    out = rpit.mask("주민등록번호 880101-1234568 입니다")
+    assert out.text == "주민등록번호 [주민등록번호] 입니다"
+    assert out.restore is None
+    assert not out.skipped
+
+
+def test_per_entity_policies():
+    policies = (rpit.PolicySet(rpit.Policy.redact_label())
+                .with_entity("phone", rpit.Policy.partial(3, 4)))
+    out = rpit.mask("카드 4111-1111-1111-1111 연락처 010-1234-5678", policies)
+    assert out.text == "카드 [카드번호] 연락처 010******5678"
+
+
+def test_fill_policy_preserves_character_count():
+    out = rpit.mask("연락처 010-1234-5678", rpit.PolicySet(rpit.Policy.redact_fill("*")))
+    assert out.text == "연락처 " + "*" * len("010-1234-5678")
+
+
+def test_tokenize_round_trips_exactly():
+    out = rpit.mask(TEXT, rpit.PolicySet(rpit.Policy.tokenize()))
+    assert "팔팔공일공일" not in out.text
+    assert rpit.unmask(out.text, out.restore) == TEXT
+
+
+def test_restore_map_survives_a_json_round_trip():
+    """프로세스가 끝나도 되돌릴 수 있어야 가역이라 부를 수 있다."""
+    out = rpit.mask(TEXT, rpit.PolicySet(rpit.Policy.tokenize()))
+    reloaded = rpit.RestoreMap.from_json(out.restore.to_json())
+    assert len(reloaded) == len(out.restore)
+    assert rpit.unmask(out.text, reloaded) == TEXT
+
+
+def test_bytes_outside_findings_are_untouched():
+    text = "앞 문장. 연락처 010-1234-5678 뒤 문장."
+    for policy in (rpit.Policy.redact_label(),
+                   rpit.Policy.redact_fill("*"),
+                   rpit.Policy.partial(3, 4),
+                   rpit.Policy.tokenize()):
+        out = rpit.mask(text, rpit.PolicySet(policy))
+        assert out.text.startswith("앞 문장. 연락처 ")
+        assert out.text.endswith(" 뒤 문장.")
+
+
+def test_text_without_pii_is_returned_verbatim():
+    text = "이번 분기 실적은 전년 대비 개선되었습니다."
+    out = rpit.mask(text, rpit.PolicySet(rpit.Policy.tokenize()))
+    assert out.text == text
+    assert out.restore.is_empty()
+
+
+def test_hash_policy_links_equal_values():
+    if not rpit.__has_hash_policy__:
+        pytest.skip("hash 기능 없이 빌드된 확장이다")
+    out = rpit.mask("연락처 010-1234-5678 과 010-1234-5678",
+                    rpit.PolicySet(rpit.Policy.hash(b"secret", 12)))
+    # 해시 토큰의 접두어는 기계가 짝을 맞추는 값이라 영문 식별자를 쓴다.
+    tokens = [part for part in out.text.split() if part.startswith("[PHONE:")]
+    assert len(tokens) == 2 and tokens[0] == tokens[1]
+
+
+# ── 산출물 언어 ──────────────────────────────────────────────
+
+
+def test_code_policy_keeps_placeholders_ascii():
+    """한국어 문서를 다루는 비한국어 사용자의 경로. 자리표시자에 한글이 없어야 한다."""
+    out = rpit.mask("카드 4111-1111-1111-1111 연락처 010-1234-5678",
+                    rpit.PolicySet(rpit.Policy.redact_code()))
+    assert out.text == "카드 [CREDIT_CARD] 연락처 [PHONE]"
+
+
+def test_label_and_code_name_the_same_entity():
+    text = "주민등록번호 880101-1234568"
+    korean = rpit.mask(text, rpit.PolicySet(rpit.Policy.redact_label()))
+    english = rpit.mask(text, rpit.PolicySet(rpit.Policy.redact_code()))
+    assert korean.text == "주민등록번호 [주민등록번호]"
+    assert english.text == "주민등록번호 [RESIDENT]"
+    assert korean.applied[0].entity == english.applied[0].entity == "resident"
+
+
+def test_entity_exposes_all_three_names():
+    f = rpit.detect("카드번호 4111-1111-1111-1111").findings[0]
+    assert f.entity == "credit_card"          # 기계용
+    assert f.entity_label == "카드번호"        # 한국어
+    assert f.entity.upper() == "CREDIT_CARD"  # 자리표시자에 쓰이는 영문
+
+
+# ── 오류 경로 ────────────────────────────────────────────────
+
+
+def test_unknown_entity_name_raises_value_error():
+    with pytest.raises(ValueError) as err:
+        rpit.PolicySet().with_entity("nope", rpit.Policy.tokenize())
+    assert "unknown entity" in str(err.value)
+
+
+def test_unknown_restore_token_raises_instead_of_silently_passing():
+    out = rpit.mask("연락처 010-1234-5678", rpit.PolicySet(rpit.Policy.tokenize()))
+    with pytest.raises(rpit.SpanMapError):
+        rpit.unmask("[[PII:99]]", out.restore)
+
+
+def test_malformed_restore_map_json_raises():
+    with pytest.raises(ValueError):
+        rpit.RestoreMap.from_json("{not json")

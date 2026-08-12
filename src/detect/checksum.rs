@@ -9,6 +9,7 @@ use serde::Serialize;
 
 /// 검증식 적용 결과.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChecksumResult {
     /// 검증식을 통과했다.
     Passed,
