@@ -9,11 +9,13 @@
 //! | 1 | [`nfc`] | 자모 분리형 한글을 음절로 합친다 |
 //! | 2 | [`fold`] | 전각을 반각으로, 대시와 공백 변종을 통일한다 |
 //! | 3 | [`hangul`] | 한글 수사를 숫자로 되돌린다 |
-//! | 4 | [`separator`] | 숫자 사이의 붙임표, 점, 공백, 괄호를 흡수한다 |
+//! | 4 | [`lookalike`] | 숫자 사이에 낀 유사문자를 숫자로 되돌린다 |
+//! | 5 | [`separator`] | 숫자 사이의 붙임표, 점, 공백, 괄호를 흡수한다 |
 //!
 //! 순서에는 이유가 있다. 자모를 먼저 합쳐야 수사 음절이 음절 단위로 보이고, 전각을 먼저
 //! 접어야 전각 숫자가 숫자로 보이며, 수사를 먼저 숫자로 바꿔야 구분자 흡수의 "양쪽이 숫자"
-//! 조건이 성립한다.
+//! 조건이 성립한다. [`lookalike`] 가 [`separator`] 앞인 것도 같은 이유의 반대편이다.
+//! 구분자가 아직 남아 있어야 `88-O1-O1` 의 `O` 가 양옆에서 숫자를 볼 수 있다.
 //!
 //! ```
 //! use rust_pii_transformer::normalize::{normalize, NormalizeConfig};
@@ -31,6 +33,7 @@
 
 pub mod fold;
 pub mod hangul;
+pub mod lookalike;
 pub mod nfc;
 pub mod separator;
 
@@ -61,6 +64,8 @@ pub struct NormalizeConfig {
     pub fold: bool,
     /// 한글 수사 역변환 패스를 켠다.
     pub hangul: bool,
+    /// 숫자 사이 유사문자 교정 패스를 켠다.
+    pub lookalike: bool,
     /// 구분자 흡수 패스를 켠다.
     pub separator: bool,
     /// 한글 수사 역변환의 오탐 억제 설정.
@@ -73,6 +78,7 @@ impl Default for NormalizeConfig {
             nfc: true,
             fold: true,
             hangul: true,
+            lookalike: true,
             separator: true,
             numeral: NumeralConfig::default(),
         }
@@ -90,6 +96,7 @@ impl NormalizeConfig {
             nfc: true,
             fold: true,
             hangul: false,
+            lookalike: false,
             separator: false,
             numeral: NumeralConfig::default(),
         }
@@ -116,6 +123,11 @@ pub fn normalize(text: &str, cfg: &NormalizeConfig) -> Result<Normalized> {
     }
     if cfg.hangul {
         let (out, pass) = hangul::apply(&current, &cfg.numeral);
+        map = SpanMap::compose(&map, &pass)?;
+        current = out;
+    }
+    if cfg.lookalike {
+        let (out, pass) = lookalike::apply(&current);
         map = SpanMap::compose(&map, &pass)?;
         current = out;
     }

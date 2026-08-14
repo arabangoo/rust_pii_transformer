@@ -340,8 +340,8 @@ def test_json_names_match_the_attribute_names():
 
 def test_entity_names_lists_every_kind():
     names = rpit.entity_names()
-    assert "resident" in names and "bank_account" in names
-    assert len(names) == 9
+    assert "resident" in names and "bank_account" in names and "passport" in names
+    assert len(names) == 10
 
 
 # ── 설정 ─────────────────────────────────────────────────────
@@ -357,6 +357,22 @@ def test_turning_off_the_hangul_pass_loses_hangul_numerals():
     cfg = rpit.Config()
     cfg.hangul = False
     assert len(rpit.detect("주민등록번호 팔팔공일공일-1234567", cfg)) == 0
+
+
+def test_turning_off_the_lookalike_pass_loses_substituted_digits():
+    cfg = rpit.Config()
+    cfg.lookalike = False
+    assert rpit.normalize("88O1O1", cfg).text == "88O1O1"
+    assert rpit.normalize("88O1O1").text == "880101"
+
+
+def test_business_words_can_be_disarmed_by_raising_the_veto():
+    text = "접수번호 010-1234-5678 로 조회하세요"
+    assert len(rpit.detect(text)) == 0
+
+    cfg = rpit.Config()
+    cfg.min_veto = 99.0
+    assert len(rpit.detect(text, cfg)) > 0
 
 
 def test_weights_are_readable_and_settable():

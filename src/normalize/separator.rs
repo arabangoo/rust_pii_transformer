@@ -1,4 +1,4 @@
-//! 4번 패스: 숫자 사이 구분자 흡수.
+//! 5번 패스: 숫자 사이 구분자 흡수.
 //!
 //! `880101 - 1234567` 과 `8801011234567` 을 같은 값으로 보게 만든다. 이 패스가 끝나면
 //! 탐지 층은 순수 숫자 런만 상대하면 되고, 그래서 정규 표현식 없이 길이 분류만으로
@@ -58,8 +58,16 @@ fn char_at(text: &str, at: usize) -> Option<char> {
     text[at..].chars().next()
 }
 
+/// 숫자 자리로 볼 수 있는 문자인가. 숫자와 마스킹 문자(`*`, `X`, `x`)를 받는다.
+///
+/// 마스킹 문자를 숫자로 세지 않으면 `1234-****-****-5678` 의 붙임표가 흡수되지 않아
+/// 네 조각으로 흩어지고, 카드번호 후보 자체가 만들어지지 않는다.
+fn is_digit_like(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '*' | 'X' | 'x')
+}
+
 fn ends_with_digit(text: &str, at: usize) -> bool {
-    text[..at].chars().next_back().is_some_and(|c| c.is_ascii_digit())
+    text[..at].chars().next_back().is_some_and(is_digit_like)
 }
 
 /// 구분자 흡수 패스를 적용한다.
@@ -90,7 +98,7 @@ pub fn apply(text: &str) -> (String, SpanMap) {
         }
 
         // 덩어리 뒤가 숫자일 때만 흡수한다.
-        if char_at(text, end).is_some_and(|c| c.is_ascii_digit()) {
+        if char_at(text, end).is_some_and(is_digit_like) {
             if flushed < cursor {
                 builder.keep(&text[flushed..cursor]);
             }

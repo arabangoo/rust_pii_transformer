@@ -24,7 +24,23 @@ fn is_domain_part(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-')
 }
 
-/// 연속한 아라비아 숫자 구간을 모두 찾는다.
+/// 숫자 런에 낄 수 있는 문자인가. 숫자와 마스킹 문자(`*`, `X`, `x`)를 받는다.
+///
+/// 마스킹 문자를 런에 넣는 이유는 **이미 부분 마스킹된 문서를 다시 처리**해야 하기 때문이다.
+/// `900513-1****67` 을 숫자가 아니라는 이유로 버리면 개인정보가 그대로 통과한다.
+fn is_run_char(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '*' | 'X' | 'x')
+}
+
+/// 런이 후보가 될 자격이 있는가.
+///
+/// 실제 숫자가 **두 자리 이상** 있어야 한다. 이 문턱이 없으면 마크다운 강조(`**`)나
+/// 곱셈 표기(`3x4`), 낱글자 `X` 가 전부 후보가 되어 잡음이 폭증한다.
+fn run_is_candidate(text: &str) -> bool {
+    text.chars().filter(|c| c.is_ascii_digit()).count() >= 2
+}
+
+/// 연속한 숫자 구간을 모두 찾는다. 마스킹 문자가 섞인 구간도 포함한다.
 ///
 /// 반환 스팬은 **정규화문 좌표계**다. 원문 좌표로 되돌리는 것은 호출자의 일이다.
 pub fn digit_runs(text: &str) -> Vec<Span> {
@@ -32,25 +48,32 @@ pub fn digit_runs(text: &str) -> Vec<Span> {
     let mut start: Option<(usize, u32)> = None;
     let mut char_index = 0u32;
 
+    let close = |runs: &mut Vec<Span>,
+                 byte_start: usize,
+                 char_start: u32,
+                 byte_end: usize,
+                 char_end: u32| {
+        if run_is_candidate(&text[byte_start..byte_end]) {
+            runs.push(Span::new(
+                byte_start as u32..byte_end as u32,
+                char_start..char_end,
+            ));
+        }
+    };
+
     for (byte_index, c) in text.char_indices() {
-        if c.is_ascii_digit() {
+        if is_run_char(c) {
             if start.is_none() {
                 start = Some((byte_index, char_index));
             }
         } else if let Some((byte_start, char_start)) = start.take() {
-            runs.push(Span::new(
-                byte_start as u32..byte_index as u32,
-                char_start..char_index,
-            ));
+            close(&mut runs, byte_start, char_start, byte_index, char_index);
         }
         char_index += 1;
     }
 
     if let Some((byte_start, char_start)) = start {
-        runs.push(Span::new(
-            byte_start as u32..text.len() as u32,
-            char_start..char_index,
-        ));
+        close(&mut runs, byte_start, char_start, text.len(), char_index);
     }
     runs
 }
@@ -121,12 +144,112 @@ pub fn emails(text: &str) -> Vec<Span> {
     found
 }
 
+/// 여권번호로 볼 수 있는 구간을 모두 찾는다.
+///
+/// 모양은 **영문 대문자 1-2 자 + 숫자 7-8 자**, 전체 8-9 자다. 대한민국 여권은 `M12345678`
+/// (구권 `S1234567`) 처럼 한 글자로 시작하고, 다른 나라 여권은 두 글자로 시작하는 것이 흔하다.
+///
+/// ## 이 모양은 검증식이 없다
+///
+/// 여권번호에는 공개된 검사 숫자가 없다. 그래서 이 스캐너가 내는 것은 **문맥이 있어야 살아남는
+/// 후보**다. 모양만 보면 `A1234567` 같은 제품 코드·주문 번호와 구분되지 않고, 실제로 그런
+/// 문자열은 문서에 흔하다. 판정은 [`super::context`] 의 여권 단서 목록이 한다.
+///
+/// 반환 스팬은 **정규화문 좌표계**다.
+pub fn passports(text: &str) -> Vec<Span> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut found = Vec::new();
+    let mut at = 0;
+
+    while at < chars.len() {
+        // 앞이 영숫자면 더 긴 토큰의 일부다. 토큰 경계에서만 시작한다.
+        if at > 0 && chars[at - 1].1.is_ascii_alphanumeric() {
+            at += 1;
+            continue;
+        }
+
+        let letters = chars[at..]
+            .iter()
+            .take(2)
+            .take_while(|&&(_, c)| c.is_ascii_uppercase())
+            .count();
+        if letters == 0 {
+            at += 1;
+            continue;
+        }
+
+        let digit_start = at + letters;
+        let digits = chars[digit_start..]
+            .iter()
+            .take_while(|&&(_, c)| c.is_ascii_digit())
+            .count();
+        let end = digit_start + digits;
+
+        // 뒤가 영숫자면 잘라 낸 조각이므로 후보가 아니다.
+        let bounded = chars
+            .get(end)
+            .map_or(true, |&(_, c)| !c.is_ascii_alphanumeric());
+        let shaped = (7..=8).contains(&digits) && (8..=9).contains(&(letters + digits));
+
+        if shaped && bounded {
+            let byte_start = chars[at].0;
+            let byte_end = chars.get(end).map_or(text.len(), |&(byte, _)| byte);
+            found.push(Span::new(
+                byte_start as u32..byte_end as u32,
+                at as u32..end as u32,
+            ));
+        }
+        at = if end > at { end } else { at + 1 };
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn slices<'a>(text: &'a str, spans: &[Span]) -> Vec<&'a str> {
         spans.iter().map(|s| s.slice(text)).collect()
+    }
+
+    #[test]
+    fn finds_passport_shapes() {
+        let text = "여권 M12345678 과 구권 S1234567 그리고 AB1234567";
+        assert_eq!(
+            slices(text, &passports(text)),
+            vec!["M12345678", "S1234567", "AB1234567"]
+        );
+    }
+
+    #[test]
+    fn rejects_shapes_that_are_not_passports() {
+        for text in [
+            "M123456",     // 숫자 여섯
+            "M123456789",  // 숫자 아홉
+            "ABC1234567",  // 영문 셋
+            "m12345678",   // 소문자
+            "1234567890",  // 영문 없음
+            "XM12345678",  // 영문 셋과 같은 폭
+            "M12345678A",  // 뒤가 이어진다
+            "ZM12345678",  // 앞 토큰의 일부
+        ] {
+            assert!(passports(text).is_empty(), "여권이 아닌데 잡혔다: {text}");
+        }
+    }
+
+    #[test]
+    fn passport_keeps_byte_and_char_offsets_separate() {
+        let text = "여권 M12345678";
+        let span = &passports(text)[0];
+        assert_eq!(span.byte.start, 7);
+        assert_eq!(span.char.start, 3);
+        assert_eq!(span.slice(text), "M12345678");
+    }
+
+    #[test]
+    fn a_passport_glued_to_a_word_is_not_a_candidate() {
+        // 앞뒤 경계를 안 보면 상품 코드 꼬리가 전부 여권이 된다.
+        assert!(passports("SKU-XM12345678").is_empty());
     }
 
     #[test]

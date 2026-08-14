@@ -235,6 +235,37 @@ fn has_numeric_context(text: &str, start: usize, end: usize, cfg: &NumeralConfig
 }
 
 /// 한글 수사 역변환 패스를 적용한다.
+/// 수사 런 끝에 붙어 삼켜지는 말끝. `(런의 끝, 그 뒤에 오는 글자)` 짝이다.
+///
+/// 문제는 어미가 **수사 음절로 시작한다**는 것이다. `구공오삼일삼이래요` 에서 `이` 는 숫자 2 이고
+/// `구` 는 9 라, 런을 욕심껏 모으면 `이` 까지 먹어 `9053132` 가 된다. 한 자리가 더 붙으면
+/// 주민등록번호 앞자리로 안 읽힌다. 음성 전사(STT) 입력에서 실제로 나는 일이다.
+///
+/// 긴 것부터 본다. `이구요` 는 `이구` 를 떼야 하고 `이요` 는 `이` 를 뗀다.
+const SENTENCE_ENDINGS: &[(&str, &str)] = &[
+    ("이구", "요"),
+    ("이", "래요"),
+    ("이", "에요"),
+    ("이", "예요"),
+    ("이", "요"),
+    ("이", "고"),
+];
+
+/// 런 끝에 말끝이 삼켜져 있으면 런을 그만큼 줄인다.
+///
+/// 떼어 낸 음절은 버리지 않는다. 다음 순회에서 다시 훑히고, 한 음절짜리 런은 최소 자릿수에
+/// 못 미쳐 변환되지 않으므로 원문 그대로 남는다.
+fn trim_sentence_ending(text: &str, start: usize, end: usize) -> usize {
+    let run = &text[start..end];
+    let rest = &text[end..];
+    for (tail, follows) in SENTENCE_ENDINGS {
+        if run.ends_with(tail) && rest.starts_with(follows) && run.len() > tail.len() {
+            return end - tail.len();
+        }
+    }
+    end
+}
+
 pub fn apply(text: &str, cfg: &NumeralConfig) -> (String, SpanMap) {
     if !text.chars().any(may_start_numeral) {
         return (text.to_string(), SpanMap::identity(text));
@@ -247,10 +278,22 @@ pub fn apply(text: &str, cfg: &NumeralConfig) -> (String, SpanMap) {
     while cursor < text.len() {
         // 이 위치에서 시작하는 수사 런을 최대한 길게 모은다.
         let mut end = cursor;
-        let mut tokens = Vec::new();
-        while let Some((token, len)) = next_token(&text[end..]) {
-            tokens.push(token);
+        while let Some((_, len)) = next_token(&text[end..]) {
             end += len;
+        }
+
+        // 말끝이 삼켜졌으면 런을 줄이고 그 범위로 다시 토큰을 모은다.
+        end = trim_sentence_ending(text, cursor, end);
+
+        let mut tokens = Vec::new();
+        let mut walk = cursor;
+        while walk < end {
+            let Some((token, len)) = next_token(&text[walk..]) else { break };
+            if walk + len > end {
+                break;
+            }
+            tokens.push(token);
+            walk += len;
         }
 
         if tokens.is_empty() {
@@ -286,6 +329,25 @@ mod tests {
 
     fn run(text: &str) -> String {
         apply(text, &NumeralConfig::default()).0
+    }
+
+    /// 음성 전사 입력. 어미가 수사 음절로 시작해 런에 삼켜지던 자리다.
+    ///
+    /// 떼어 낸 음절은 사라지지 않고 원문 그대로 남는다 — 숫자로 읽지 않을 뿐이다.
+    #[test]
+    fn sentence_endings_are_not_swallowed_into_the_run() {
+        assert_eq!(run("구공오삼일삼이래요"), "905313이래요");
+        assert_eq!(run("구공오삼일삼이에요"), "905313이에요");
+        assert_eq!(run("구공오삼일삼이예요"), "905313이예요");
+        assert_eq!(run("구공오삼일삼이요"), "905313이요");
+        assert_eq!(run("구공오삼일삼이고"), "905313이고");
+        assert_eq!(run("구공오삼일삼이구요"), "905313이구요");
+    }
+
+    #[test]
+    fn a_trailing_numeral_that_is_not_an_ending_stays_in_the_run() {
+        // 뒤에 말끝이 없으면 `이` 는 그냥 숫자 2 다.
+        assert_eq!(run("구공오삼일삼이"), "9053132");
     }
 
     #[test]

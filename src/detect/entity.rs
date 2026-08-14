@@ -39,6 +39,8 @@ pub enum EntityKind {
     DriverLicense,
     /// 생년월일.
     BirthDate,
+    /// 여권번호.
+    Passport,
 }
 
 impl EntityKind {
@@ -57,6 +59,7 @@ impl EntityKind {
             EntityKind::Email => "이메일",
             EntityKind::DriverLicense => "운전면허번호",
             EntityKind::BirthDate => "생년월일",
+            EntityKind::Passport => "여권번호",
         }
     }
 
@@ -76,6 +79,7 @@ impl EntityKind {
             EntityKind::Email => "email",
             EntityKind::DriverLicense => "driver_license",
             EntityKind::BirthDate => "birth_date",
+            EntityKind::Passport => "passport",
         }
     }
 
@@ -95,6 +99,7 @@ impl EntityKind {
             EntityKind::Email => "EMAIL",
             EntityKind::DriverLicense => "DRIVER_LICENSE",
             EntityKind::BirthDate => "BIRTH_DATE",
+            EntityKind::Passport => "PASSPORT",
         }
     }
 
@@ -117,6 +122,7 @@ pub const ALL: &[EntityKind] = &[
     EntityKind::Email,
     EntityKind::DriverLicense,
     EntityKind::BirthDate,
+    EntityKind::Passport,
 ];
 
 /// 판정 등급.
@@ -175,8 +181,14 @@ const LICENSE_REGIONS: &[&str] = &[
 ];
 
 /// 숫자 런을 문자열로 되돌린다. 접두 비교에 쓴다.
+///
+/// 가려진 자리는 `*` 로 낸다. 그래서 `text[..3] == "010"` 같은 접두 검사가 마스킹된 값에서
+/// 저절로 실패한다. 모르는 것을 아는 척하지 않는 쪽으로 기운다.
 fn as_text(digits: &[u8]) -> String {
-    digits.iter().map(|d| char::from(b'0' + d)).collect()
+    digits
+        .iter()
+        .map(|&d| if d == checksum::MASKED { '*' } else { char::from(b'0' + d) })
+        .collect()
 }
 
 /// 숫자 런 하나에서 가능한 모든 후보를 낸다.
@@ -188,6 +200,27 @@ pub fn candidates(digits: &[u8]) -> Vec<Candidate> {
     // 주민등록번호와 외국인등록번호. 성별코드가 둘을 가른다.
     if let Some(analysis) = checksum::analyze_resident(digits) {
         // 앞 6자리가 실재하는 날짜가 아니면 등록번호가 아니다. 이것만은 검증식보다 강한 제약이다.
+        //
+        // 예외가 하나 있다. 앞자리가 가려져 있으면 날짜를 확인할 방법 자체가 없다. 이때는
+        // 후보에서 빼는 대신 **문맥을 필수로 걸고 기본점을 낮춰** 남긴다. 마스킹된 문서를
+        // 다시 처리하는 경우가 실무에 있고, 날짜 제약을 못 쓰는 만큼 문맥이 그 자리를 메운다.
+        if analysis.birth.is_none() && checksum::has_masked(digits) {
+            let (entity, rule, cues) = if analysis.gender.foreigner {
+                (EntityKind::ForeignerRegistration, "resident.foreigner_masked", context::FOREIGNER)
+            } else {
+                (EntityKind::Resident, "resident.korean_masked", context::RESIDENT)
+            };
+            out.push(Candidate {
+                entity,
+                rule,
+                checksum: analysis.checksum,
+                ceiling: Certainty::Probable,
+                cues,
+                base: 0.2,
+                needs_context: true,
+            });
+        }
+
         if analysis.birth.is_some() {
             let (entity, rule, cues) = if analysis.gender.foreigner {
                 (
@@ -202,7 +235,12 @@ pub fn candidates(digits: &[u8]) -> Vec<Candidate> {
                 entity,
                 rule,
                 checksum: analysis.checksum,
-                ceiling: Certainty::Certain,
+                // 가려진 자리가 있으면 검증식을 못 돌리므로 천장도 함께 내린다.
+                ceiling: if checksum::has_masked(digits) {
+                    Certainty::Probable
+                } else {
+                    Certainty::Certain
+                },
                 cues,
                 base: 0.6,
                 needs_context: false,
@@ -304,6 +342,25 @@ pub fn candidates(digits: &[u8]) -> Vec<Candidate> {
     out
 }
 
+/// 여권번호 후보. 모양은 [`super::scanner::passports`] 가 이미 가렸다.
+///
+/// 숫자 런이 아니라 영숫자 토큰에서 나오므로 [`candidates`] 와 별도 입구다.
+///
+/// 문맥이 필수이고 기본점이 바닥인 이유는 같다. **여권번호에는 공개된 검증식이 없고 모양이
+/// 흔하다.** `A1234567` 은 주문 번호이기도 하고 부품 코드이기도 하다. 형식만으로 개인정보라고
+/// 부르면 문서 하나에서 오탐이 수십 건 난다. 그래서 판정을 전부 문맥에 맡긴다.
+pub fn passport_candidate() -> Candidate {
+    Candidate {
+        entity: EntityKind::Passport,
+        rule: "passport.shape",
+        checksum: ChecksumResult::NotApplicable("여권번호에는 공개된 검증식이 없다"),
+        ceiling: Certainty::Probable,
+        cues: context::PASSPORT,
+        base: 0.1,
+        needs_context: true,
+    }
+}
+
 /// 전화번호 형태를 가른다. 아니면 `None`.
 fn phone_rule(text: &str) -> Option<&'static str> {
     let len = text.len();
@@ -328,7 +385,13 @@ fn phone_rule(text: &str) -> Option<&'static str> {
 }
 
 /// 생년월일 형태를 가른다. 여섯 자리와 여덟 자리를 본다.
+///
+/// 생년월일은 검증식이 없고 날짜 유효성이 유일한 제약이라, 가려진 자리가 있으면 그 제약이
+/// 사라진다. 남는 것이 자릿수뿐이면 일반 숫자와 구분되지 않으므로 후보에서 뺀다.
 fn birth_date_rule(digits: &[u8]) -> Option<&'static str> {
+    if checksum::has_masked(digits) {
+        return None;
+    }
     match digits.len() {
         6 => {
             let yy = u16::from(digits[0]) * 10 + u16::from(digits[1]);

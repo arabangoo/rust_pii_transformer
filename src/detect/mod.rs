@@ -88,6 +88,11 @@ pub struct Config {
     pub min_score: f32,
     /// 문맥이 필수인 엔티티가 요구하는 최소 문맥 총점.
     pub min_context: f32,
+    /// 부정 문맥이 후보를 버릴 수 있게 되는 최소 총점.
+    ///
+    /// 이 값 미만이면 부정 단서가 있어도 아무 일도 하지 않는다. 0 으로 두면 스치듯 걸린
+    /// 낱말 하나가 판정을 뒤집는다. 자세한 규칙은 [`context::EXCLUDE`] 에 적었다.
+    pub min_veto: f32,
     /// 점수 가중치.
     pub weights: Weights,
 }
@@ -99,6 +104,7 @@ impl Default for Config {
             context_window: 24,
             min_score: 0.5,
             min_context: 0.3,
+            min_veto: 0.5,
             weights: Weights::default(),
         }
     }
@@ -148,8 +154,10 @@ pub enum RejectReason {
     NoContext,
     /// 점수가 문턱에 못 미쳤다.
     BelowThreshold,
-    /// 같은 구간에서 더 강한 후보에게 밀렸다.
+    /// 같은 구간에서 더 강한 후보에게 밀렸다. 더 넓은 결과에 삼켜진 경우도 여기다.
     Outranked,
+    /// 주변 낱말이 개인정보가 아니라고 말했다. 계약번호·상품코드 따위다.
+    BusinessContext,
 }
 
 /// 형식은 맞았는데 판정에서 떨어진 후보.
@@ -204,6 +212,50 @@ pub fn detect(text: &str, cfg: &Config) -> Result<Report> {
         });
     }
 
+    // 여권번호는 영문자를 포함해 숫자 런에 잡히지 않는다. 별도로 훑는다.
+    for span in scanner::passports(&normalized.text) {
+        let source = normalized.map.to_source(&span);
+        let candidate = entity::passport_candidate();
+        let hits = context::find(&normalized.text, &span, cfg.context_window, candidate.cues);
+        let context_total = context::total(&hits);
+        let veto = veto_total(&normalized.text, &span, cfg);
+        let evaluated = evaluate(&candidate, context_total, &source.cost, &cfg.weights);
+
+        let reason = if vetoed(&candidate, context_total, veto, cfg) {
+            Some(RejectReason::BusinessContext)
+        } else if context_total < cfg.min_context {
+            Some(RejectReason::NoContext)
+        } else if evaluated.score < cfg.min_score {
+            Some(RejectReason::BelowThreshold)
+        } else {
+            None
+        };
+
+        match reason {
+            Some(reason) => rejections.push(Rejection {
+                entity: candidate.entity,
+                source: source.span,
+                reason,
+                score: evaluated.score,
+            }),
+            None => findings.push(Finding {
+                entity: candidate.entity,
+                source: source.span,
+                normalized: span,
+                certainty: evaluated.certainty,
+                score: evaluated.score,
+                evidence: Evidence {
+                    rule: candidate.rule,
+                    checksum: candidate.checksum,
+                    context_hits: hits,
+                    normalizations: source.rules,
+                    cost: source.cost,
+                    snapped: source.snapped,
+                },
+            }),
+        }
+    }
+
     for span in scanner::digit_runs(&normalized.text) {
         let digits = match checksum::to_digits(span.slice(&normalized.text)) {
             Some(digits) => digits,
@@ -213,6 +265,7 @@ pub fn detect(text: &str, cfg: &Config) -> Result<Report> {
 
         let mut best: Option<(Finding, f32)> = None;
         let mut local_rejections = Vec::new();
+        let veto = veto_total(&normalized.text, &span, cfg);
 
         for candidate in entity::candidates(&digits) {
             let hits = context::find(&normalized.text, &span, cfg.context_window, candidate.cues);
@@ -220,7 +273,9 @@ pub fn detect(text: &str, cfg: &Config) -> Result<Report> {
 
             let evaluated = evaluate(&candidate, context_total, &source.cost, &cfg.weights);
 
-            let reason = if candidate.needs_context && context_total < cfg.min_context {
+            let reason = if vetoed(&candidate, context_total, veto, cfg) {
+                Some(RejectReason::BusinessContext)
+            } else if candidate.needs_context && context_total < cfg.min_context {
                 Some(RejectReason::NoContext)
             } else if evaluated.score < cfg.min_score {
                 Some(if candidate.checksum.failed() {
@@ -287,6 +342,8 @@ pub fn detect(text: &str, cfg: &Config) -> Result<Report> {
         rejections.append(&mut local_rejections);
     }
 
+    drop_contained(&mut findings, &mut rejections);
+
     findings.sort_by_key(|f| (f.source.byte.start, f.source.byte.end));
     rejections.sort_by_key(|r| (r.source.byte.start, r.source.byte.end));
 
@@ -295,6 +352,60 @@ pub fn detect(text: &str, cfg: &Config) -> Result<Report> {
         rejections,
         normalized_text: normalized.text,
     })
+}
+
+/// 더 넓은 결과에 통째로 삼켜진 결과를 걷어낸다.
+///
+/// 스캐너가 둘이라 같은 자리를 두 번 낼 수 있다. 여권번호 `M12345678` 안에는 여덟 자리 숫자
+/// 런이 들어 있어 여권 스캐너와 숫자 스캐너가 각각 후보를 낸다. **넓은 쪽이 좁은 쪽을 이미
+/// 설명하므로** 좁은 쪽을 버린다. 버린 것도 사유와 함께 남겨 조사할 수 있게 둔다.
+///
+/// 같은 폭이면 아무것도 버리지 않는다. 같은 구간 안에서의 경쟁은 후보 평가 단계가 이미 끝냈다.
+fn drop_contained(findings: &mut Vec<Finding>, rejections: &mut Vec<Rejection>) {
+    let spans: Vec<Span> = findings.iter().map(|f| f.source.clone()).collect();
+    let swallowed: Vec<bool> = spans
+        .iter()
+        .map(|mine| {
+            spans.iter().any(|other| {
+                other.byte.start <= mine.byte.start
+                    && mine.byte.end <= other.byte.end
+                    && other.byte.end - other.byte.start > mine.byte.end - mine.byte.start
+            })
+        })
+        .collect();
+
+    let mut at = 0;
+    findings.retain(|finding| {
+        let keep = !swallowed[at];
+        if !keep {
+            rejections.push(Rejection {
+                entity: finding.entity,
+                source: finding.source.clone(),
+                reason: RejectReason::Outranked,
+                score: finding.score,
+            });
+        }
+        at += 1;
+        keep
+    });
+}
+
+/// 이 구간 주변의 부정 문맥 총점.
+fn veto_total(text: &str, span: &Span, cfg: &Config) -> f32 {
+    context::total(&context::find(
+        text,
+        span,
+        cfg.context_window,
+        context::EXCLUDE,
+    ))
+}
+
+/// 부정 문맥이 이 후보를 버리는가.
+///
+/// 조건이 셋 다 서야 버린다. **검증식을 통과하지 않았고**, 부정 총점이 문턱을 넘었고,
+/// 그 총점이 긍정 총점보다 무거울 때다. 근거를 세는 방식은 [`context::EXCLUDE`] 에 적었다.
+fn vetoed(candidate: &Candidate, context_total: f32, veto: f32, cfg: &Config) -> bool {
+    !candidate.checksum.passed() && veto >= cfg.min_veto && veto > context_total
 }
 
 struct Evaluated {
@@ -439,7 +550,7 @@ mod tests {
     #[test]
     fn account_number_needs_context() {
         // 문맥이 없으면 계좌번호로 보지 않는다. 이 라이브러리의 오탐 억제 핵심이다.
-        let bare = run("접수번호 1234567890123 입니다");
+        let bare = run("첨부 자료 1234567890123 참고하세요");
         assert!(!entities(&bare).contains(&EntityKind::BankAccount));
         assert!(bare
             .rejections
@@ -472,6 +583,146 @@ mod tests {
             .expect("검증식이 떨어져도 문맥이 있으면 살아야 한다");
         assert!(finding.evidence.checksum.failed());
         assert_eq!(finding.certainty, Certainty::Probable);
+    }
+
+    // ── 마스킹된 값 ────────────────────────────────────────
+
+    /// 이미 부분 마스킹된 문서를 다시 처리하는 경우. 숫자가 아니라는 이유로 버리면 그대로 샌다.
+    #[test]
+    fn a_masked_resident_number_is_detected() {
+        let text = "주민등록번호 900513-1****67 입니다";
+        let report = run(text);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.entity == EntityKind::Resident)
+            .expect("가려진 자리가 있어도 주민등록번호로 잡혀야 한다");
+        assert_eq!(finding.source.slice(text), "900513-1****67");
+    }
+
+    /// 모른다는 사실이 등급으로 표현되어야 한다.
+    #[test]
+    fn a_masked_value_cannot_reach_certain() {
+        let report = run("주민등록번호 900513-1****67 입니다");
+        let finding = &report.findings[0];
+        assert!(
+            matches!(finding.evidence.checksum, ChecksumResult::NotApplicable(_)),
+            "가려진 자리가 있으면 검증식을 적용할 수 없다"
+        );
+        assert!(finding.certainty < Certainty::Certain);
+    }
+
+    #[test]
+    fn a_masked_card_number_survives_separator_absorption() {
+        let text = "카드번호 1234-****-****-5678 로 결제";
+        let report = run(text);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.entity == EntityKind::CreditCard)
+            .expect("마스킹된 카드번호도 한 덩어리로 모여야 한다");
+        assert_eq!(finding.source.slice(text), "1234-****-****-5678");
+    }
+
+    /// 마스킹 문자를 런에 넣으면 잡음이 늘 수 있다. 실제 숫자 두 자리 문턱이 그것을 막는다.
+    #[test]
+    fn mask_characters_alone_are_not_candidates() {
+        for text in [
+            "**굵게** 표시한 문장",
+            "가로 세로 비율은 3x4 입니다",
+            "X 표시를 눌러 닫습니다",
+        ] {
+            let report = run(text);
+            assert!(report.findings.is_empty(), "잡음이 후보가 됐다: {text}");
+        }
+    }
+
+    /// 앞자리가 가려지면 날짜 제약이 사라진다. 그 자리를 문맥이 메운다.
+    #[test]
+    fn a_fully_masked_prefix_requires_context() {
+        assert!(
+            entities(&run("접수 ****131234567 참고")).is_empty(),
+            "문맥이 없으면 날짜를 못 확인한 13자리를 내지 않는다"
+        );
+        assert!(
+            entities(&run("주민등록번호 ****131234567 입니다")).contains(&EntityKind::Resident),
+            "문맥이 있으면 남긴다"
+        );
+    }
+
+    #[test]
+    fn a_passport_number_needs_context() {
+        assert_eq!(
+            entities(&run("여권번호 M12345678 로 예약했습니다")),
+            vec![EntityKind::Passport]
+        );
+        assert!(
+            entities(&run("모델 M12345678 재고 확인 바랍니다")).is_empty(),
+            "여권 단서가 없으면 제품 코드와 구분되지 않는다"
+        );
+    }
+
+    /// 여권번호는 검증식이 없어 문맥이 아무리 좋아도 확정 등급에 오르지 않는다.
+    #[test]
+    fn a_passport_number_cannot_reach_certain() {
+        let report = run("여권번호 M12345678 입니다");
+        assert_eq!(report.findings[0].certainty, Certainty::Probable);
+    }
+
+    /// 여권번호 안의 숫자 런이 계좌번호 따위로 따로 잡히면 안 된다.
+    #[test]
+    fn the_digit_run_inside_a_passport_is_swallowed() {
+        let report = run("여권번호 M12345678 로 예약했습니다");
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].source.slice("여권번호 M12345678 로 예약했습니다"), "M12345678");
+    }
+
+    #[test]
+    fn business_words_drop_candidates_that_have_no_checksum() {
+        let report = run("접수번호 1234567890 로 조회하세요");
+        assert!(entities(&report).is_empty());
+        assert!(
+            report
+                .rejections
+                .iter()
+                .any(|r| r.reason == RejectReason::BusinessContext),
+            "왜 버렸는지가 사유로 남아야 한다"
+        );
+    }
+
+    /// 검증식을 통과한 값은 이름표가 잘못 붙어 있어도 개인정보다.
+    #[test]
+    fn a_valid_checksum_survives_business_words() {
+        // 880101-1234568 은 검증식을 만족한다.
+        let report = run("증권번호 880101-1234568 조회");
+        assert!(entities(&report).contains(&EntityKind::Resident));
+    }
+
+    /// 두 종류의 낱말이 한 창에 같이 들어오는 문장이 실무에 흔하다.
+    #[test]
+    fn a_nearer_positive_cue_outweighs_a_business_word() {
+        let report = run("계약번호 확인 후 연락처 010-1234-5678 로 회신 바랍니다");
+        assert!(entities(&report).contains(&EntityKind::Phone));
+    }
+
+    /// 회사 안내 번호까지 개인정보로 세면 마스킹 결과가 읽히지 않는다.
+    #[test]
+    fn a_call_center_number_is_not_personal() {
+        assert!(entities(&run("고객센터 1588-1234 로 문의하세요")).is_empty());
+    }
+
+    /// 부정 문맥을 끄는 손잡이가 실제로 듣는지 본다.
+    #[test]
+    fn raising_min_veto_disarms_the_business_dictionary() {
+        let text = "접수번호 010-1234-5678 로 조회하세요";
+        assert!(entities(&run(text)).is_empty());
+
+        let cfg = Config { min_veto: 99.0, ..Config::default() };
+        let report = detect(text, &cfg).unwrap();
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.entity == EntityKind::Phone));
     }
 
     #[test]

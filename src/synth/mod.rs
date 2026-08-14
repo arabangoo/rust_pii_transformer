@@ -84,6 +84,18 @@ pub enum Variant {
     Fullwidth,
     /// 앞 여섯 자리를 한글 자릿수 읽기로. `팔팔공일공일-1234568`
     HangulDigits,
+    /// 안쪽 숫자 몇 개를 닮은 영문자로. `88O1O11234568`
+    ///
+    /// 다국어 개인정보 벤치마크가 프론티어 모델의 실패 모드로 지목한 문자 치환이다.
+    Lookalike,
+    /// 뒷자리를 별표로 가린다. `880101-1******`
+    ///
+    /// 이미 한 번 가려진 문서를 다시 처리하는 경우다. 검증식을 쓸 수 없게 된다.
+    Masked,
+    /// 전체를 한글 자릿수로 읽고 말끝을 붙인다. `팔팔공일공일일이삼사오육팔이래요`
+    ///
+    /// 음성 전사 입력이다. 어미가 수사 음절로 시작해 값에 삼켜지는 자리다.
+    SentenceEnding,
     /// 숫자가 아닌 값. 이메일처럼 변형이 없는 엔티티에 쓴다.
     Literal,
 }
@@ -97,6 +109,9 @@ impl Variant {
             Variant::Space => "공백",
             Variant::Fullwidth => "전각",
             Variant::HangulDigits => "한글수사",
+            Variant::Lookalike => "유사문자",
+            Variant::Masked => "부분마스킹",
+            Variant::SentenceEnding => "말끝",
             Variant::Literal => "원형",
         }
     }
@@ -232,6 +247,16 @@ fn birth_eight(rng: &mut Rng) -> String {
     format!("{year:04}{month:02}{day:02}")
 }
 
+/// 여권번호. 대한민국 신권은 영문 한 글자에 숫자 여덟 자다.
+fn passport(rng: &mut Rng) -> String {
+    const HEADS: [&str; 3] = ["M", "S", "R"];
+    let mut out = String::from(*rng.pick(&HEADS));
+    for _ in 0..8 {
+        out.push(char::from(b'0' + rng.below(10) as u8));
+    }
+    out
+}
+
 /// 이메일 주소.
 fn email(rng: &mut Rng) -> String {
     const NAMES: [&str; 6] = ["minsu.kim", "jiwon", "hyeon_lee", "sara.park", "dohoon", "yuna99"];
@@ -257,7 +282,8 @@ fn group_positions(entity: EntityKind, len: usize) -> Vec<usize> {
                 vec![3, 8]
             }
         }
-        EntityKind::Email => Vec::new(),
+        // 여권번호는 구분자 없이 붙여 쓰는 것이 표준 표기다.
+        EntityKind::Email | EntityKind::Passport => Vec::new(),
     }
 }
 
@@ -303,6 +329,49 @@ fn to_hangul_digits(value: &str, count: usize) -> String {
     out
 }
 
+/// 안쪽 숫자 몇 개를 닮은 영문자로 바꾼다. `0` 은 `O`, `1` 은 `l` 이다.
+///
+/// 양 끝은 건드리지 않고, **바꾼 자리끼리 붙지 않게** 한 칸을 띄운다. 붙여 놓으면 서로의
+/// 이웃이 숫자가 아니게 되어 교정 패스가 둘 다 포기한다. 실제 오탈자도 이렇게 뭉치지 않는다.
+fn to_lookalike(value: &str, limit: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    let mut changed = 0;
+    let mut previous = false;
+
+    for (index, &c) in chars.iter().enumerate() {
+        let interior = index > 0 && index + 1 < chars.len();
+        let swapped = match c {
+            '0' if interior && !previous && changed < limit => Some('O'),
+            '1' if interior && !previous && changed < limit => Some('l'),
+            _ => None,
+        };
+        match swapped {
+            Some(letter) => {
+                out.push(letter);
+                changed += 1;
+                previous = true;
+            }
+            None => {
+                out.push(c);
+                previous = false;
+            }
+        }
+    }
+    out
+}
+
+/// 뒤에서부터 `count` 자리를 별표로 가린다. 첫 자리는 남긴다.
+fn to_masked(value: &str, count: usize) -> String {
+    let total = value.chars().count();
+    let keep = total.saturating_sub(count).max(1);
+    value
+        .chars()
+        .enumerate()
+        .map(|(index, c)| if index < keep { c } else { '*' })
+        .collect()
+}
+
 /// 값을 표기 변형에 맞춰 렌더링한다.
 fn render(entity: EntityKind, value: &str, variant: Variant) -> String {
     let positions = group_positions(entity, value.chars().count());
@@ -311,12 +380,30 @@ fn render(entity: EntityKind, value: &str, variant: Variant) -> String {
         Variant::Hyphen => insert_separator(value, &positions, '-'),
         Variant::Space => insert_separator(value, &positions, ' '),
         Variant::Fullwidth => to_fullwidth(value),
+        Variant::Lookalike => to_lookalike(value, 2),
+        Variant::Masked => to_masked(value, masked_tail(entity)),
+        Variant::SentenceEnding => {
+            // 값 전체를 읽고 말끝을 붙인다. 어미 첫 음절 `이` 는 숫자 2 이기도 하다.
+            format!("{}이래요", to_hangul_digits(value, value.chars().count()))
+        }
         Variant::HangulDigits => {
             let hangul = to_hangul_digits(value, 6);
             // 한글 여섯 음절 뒤에 하이픈을 넣어 숫자 표지에 붙인다.
             let (head, tail) = hangul.split_at(hangul.char_indices().nth(6).map_or(hangul.len(), |(i, _)| i));
             format!("{head}-{tail}")
         }
+    }
+}
+
+/// 이 엔티티에서 별표로 가릴 뒷자리 수.
+///
+/// 앞자리를 가리면 생년 부분이 사라져 판정 근거가 통째로 없어진다. 실무의 부분 마스킹도
+/// 뒤에서부터 가린다.
+fn masked_tail(entity: EntityKind) -> usize {
+    match entity {
+        EntityKind::CreditCard => 8,
+        EntityKind::Resident | EntityKind::ForeignerRegistration => 6,
+        _ => 4,
     }
 }
 
@@ -334,6 +421,7 @@ fn with_cue(entity: EntityKind) -> &'static str {
         EntityKind::Email => "메일은 {} 로 보내주세요",
         EntityKind::DriverLicense => "운전면허번호 {} 확인 부탁드립니다",
         EntityKind::BirthDate => "생년월일 {} 로 등록해 주세요",
+        EntityKind::Passport => "여권번호 {} 로 예약했습니다",
     }
 }
 
@@ -357,7 +445,10 @@ fn assemble(template: &str, rendered: &str) -> (String, Range<u32>) {
 fn works_without_context(entity: EntityKind) -> bool {
     !matches!(
         entity,
-        EntityKind::BankAccount | EntityKind::DriverLicense | EntityKind::BirthDate
+        EntityKind::BankAccount
+            | EntityKind::DriverLicense
+            | EntityKind::BirthDate
+            | EntityKind::Passport
     )
 }
 
@@ -370,18 +461,48 @@ fn variants_for(entity: EntityKind) -> &'static [Variant] {
             Variant::Space,
             Variant::Fullwidth,
             Variant::HangulDigits,
+            Variant::Lookalike,
+            Variant::Masked,
+            Variant::SentenceEnding,
         ],
-        EntityKind::CreditCard => {
-            &[Variant::Plain, Variant::Hyphen, Variant::Space, Variant::Fullwidth]
-        }
-        EntityKind::BusinessRegistration | EntityKind::Phone => {
-            &[Variant::Plain, Variant::Hyphen, Variant::Fullwidth]
-        }
+        EntityKind::CreditCard => &[
+            Variant::Plain,
+            Variant::Hyphen,
+            Variant::Space,
+            Variant::Fullwidth,
+            Variant::Lookalike,
+            Variant::Masked,
+        ],
+        EntityKind::BusinessRegistration => &[
+            Variant::Plain,
+            Variant::Hyphen,
+            Variant::Fullwidth,
+            Variant::Lookalike,
+            Variant::Masked,
+        ],
+        EntityKind::Phone => &[
+            Variant::Plain,
+            Variant::Hyphen,
+            Variant::Fullwidth,
+            Variant::Lookalike,
+            Variant::Masked,
+            Variant::SentenceEnding,
+        ],
         EntityKind::BankAccount | EntityKind::DriverLicense | EntityKind::BirthDate => {
             &[Variant::Plain, Variant::Hyphen]
         }
-        EntityKind::Email => &[Variant::Literal],
+        // 여권번호는 영문자가 섞여 있어 자릿수 읽기·전각 변형의 대상이 아니다.
+        EntityKind::Email | EntityKind::Passport => &[Variant::Literal],
     }
+}
+
+/// 이 표기가 문맥 단서 없이도 성립하는가.
+///
+/// 가려진 값은 검증식을 쓸 수 없고, 말끝이 붙은 값은 음절을 펼친 비용을 문다. 둘 다 문맥이
+/// 없으면 문턱 아래로 떨어지는 것이 **설계된 동작**이다. 그런 표본을 무문맥으로 만들어
+/// 미탐으로 세면 코퍼스가 설계를 결함으로 오해한다.
+fn variant_works_without_context(variant: Variant) -> bool {
+    !matches!(variant, Variant::Masked | Variant::SentenceEnding)
 }
 
 /// 이 코퍼스가 다루는 엔티티.
@@ -395,6 +516,7 @@ pub const ENTITIES: &[EntityKind] = &[
     EntityKind::BankAccount,
     EntityKind::DriverLicense,
     EntityKind::BirthDate,
+    EntityKind::Passport,
 ];
 
 fn value_for(rng: &mut Rng, entity: EntityKind) -> String {
@@ -408,6 +530,7 @@ fn value_for(rng: &mut Rng, entity: EntityKind) -> String {
         EntityKind::BankAccount => account(rng),
         EntityKind::DriverLicense => license(rng),
         EntityKind::BirthDate => birth_eight(rng),
+        EntityKind::Passport => passport(rng),
     }
 }
 
@@ -426,7 +549,7 @@ pub fn positive(rng: &mut Rng, entity: EntityKind, variant: Variant, with_contex
 /// 번호가 우연히 Luhn 을 통과하면 그것은 이 라이브러리의 진짜 오탐이고, 그 확률까지 수치에
 /// 반영되는 것이 맞다.
 pub fn negative(rng: &mut Rng) -> Sample {
-    let choice = rng.below(7);
+    let choice = rng.below(10);
     let (text, trap) = match choice {
         0 => (
             format!("주문번호 {}{} 로 접수되었습니다", 2 + rng.below(8), to_text(&(0..10).map(|_| rng.digit()).collect::<Vec<_>>())),
@@ -456,6 +579,22 @@ pub fn negative(rng: &mut Rng) -> Sample {
             String::from("이사 갑니다. 사구 팔구 방식으로 진행하고 구이 정식을 주문했습니다."),
             "수사 음절로 이루어진 일상어",
         ),
+        6 => (
+            format!("증권번호 {} 로 조회하세요", to_text(&(0..12).map(|_| rng.digit()).collect::<Vec<_>>())),
+            "12자리 증권번호 (부정 문맥)",
+        ),
+        7 => (
+            format!(
+                "고객센터 15{}-{} 로 문의 바랍니다",
+                to_text(&(0..2).map(|_| rng.digit()).collect::<Vec<_>>()),
+                to_text(&(0..4).map(|_| rng.digit()).collect::<Vec<_>>())
+            ),
+            "대표번호 (개인의 전화번호가 아니다)",
+        ),
+        8 => (
+            format!("계약번호 {} 확인 부탁드립니다", to_text(&(0..10).map(|_| rng.digit()).collect::<Vec<_>>())),
+            "10자리 계약번호 (사업자등록번호와 같은 폭)",
+        ),
         _ => (
             format!("회원번호 {} 등급 조회 결과", to_text(&(0..9).map(|_| rng.digit()).collect::<Vec<_>>())),
             "9자리 회원번호",
@@ -480,7 +619,9 @@ pub fn corpus(seed: u64, rounds: usize) -> Vec<Sample> {
             }
             if works_without_context(entity) {
                 for &variant in variants_for(entity) {
-                    out.push(positive(&mut rng, entity, variant, false));
+                    if variant_works_without_context(variant) {
+                        out.push(positive(&mut rng, entity, variant, false));
+                    }
                 }
             }
         }
@@ -556,6 +697,30 @@ mod tests {
             render(EntityKind::Resident, value, Variant::HangulDigits),
             "팔팔공일공일-1234568"
         );
+        assert_eq!(
+            render(EntityKind::Resident, value, Variant::Masked),
+            "8801011******"
+        );
+        assert_eq!(
+            render(EntityKind::Resident, value, Variant::SentenceEnding),
+            "팔팔공일공일일이삼사오육팔이래요"
+        );
+    }
+
+    /// 바꾼 자리끼리 붙으면 교정 패스가 양쪽 다 포기한다.
+    #[test]
+    fn lookalike_substitutions_never_touch_or_reach_the_edges() {
+        assert_eq!(to_lookalike("8801011234568", 2), "88O1O11234568");
+        assert_eq!(to_lookalike("0000000", 2), "0O0O000", "붙지 않게 한 칸 띄운다");
+        assert_eq!(to_lookalike("1234561", 2), "1234561", "양 끝은 안 바꾼다");
+    }
+
+    /// 유사문자 표기가 정규화를 거쳐 원래 숫자로 돌아와야 코퍼스가 의미를 갖는다.
+    #[test]
+    fn lookalike_rendering_survives_normalization() {
+        let cfg = crate::normalize::NormalizeConfig::default();
+        let out = crate::normalize::normalize(&to_lookalike("8801011234568", 2), &cfg).unwrap();
+        assert_eq!(out.text, "8801011234568");
     }
 
     #[test]

@@ -95,17 +95,43 @@ pub fn analyze_resident(digits: &[u8]) -> Option<ResidentAnalysis> {
     if digits.len() != 13 {
         return None;
     }
-    let gender = gender_code(digits[6])?;
 
-    let yy = u16::from(digits[0]) * 10 + u16::from(digits[1]);
-    let mm = digits[2] * 10 + digits[3];
-    let dd = digits[4] * 10 + digits[5];
-    let year = gender.century + yy;
-    let birth = if is_valid_date(year, mm, dd) {
-        Some((year, mm, dd))
-    } else {
-        None
+    // 성별코드가 가려져 있으면 세기도 내국인 여부도 알 수 없다. 후보에서 빼는 대신
+    // 1900년대 내국인으로 가정하고, 아래에서 두 세기를 모두 시험해 날짜를 판정한다.
+    let gender = match gender_code(digits[6]) {
+        Some(g) => g,
+        None if digits[6] == MASKED => GenderCode { century: 1900, foreigner: false },
+        None => return None,
     };
+
+    // 앞 6자리에 가려진 자리가 있으면 날짜를 확인할 방법이 없다.
+    let birth = if has_masked(&digits[..6]) {
+        None
+    } else {
+        let yy = u16::from(digits[0]) * 10 + u16::from(digits[1]);
+        let mm = digits[2] * 10 + digits[3];
+        let dd = digits[4] * 10 + digits[5];
+        if digits[6] == MASKED {
+            // 세기를 모르므로 둘 중 하나라도 실재하면 인정한다.
+            [1900u16, 2000]
+                .into_iter()
+                .map(|c| c + yy)
+                .find(|&year| is_valid_date(year, mm, dd))
+                .map(|year| (year, mm, dd))
+        } else {
+            let year = gender.century + yy;
+            is_valid_date(year, mm, dd).then_some((year, mm, dd))
+        }
+    };
+
+    // 가려진 자리가 하나라도 있으면 검증식을 돌릴 수 없다.
+    if has_masked(digits) {
+        return Some(ResidentAnalysis {
+            gender,
+            birth,
+            checksum: ChecksumResult::NotApplicable("가려진 자리가 있어 검증식을 적용할 수 없다"),
+        });
+    }
 
     let sum: u32 = digits[..12]
         .iter()
@@ -148,6 +174,9 @@ pub fn business_registration(digits: &[u8]) -> ChecksumResult {
     if digits.len() != 10 {
         return ChecksumResult::NotApplicable("사업자등록번호는 10자리다");
     }
+    if has_masked(digits) {
+        return ChecksumResult::NotApplicable("가려진 자리가 있어 검증식을 적용할 수 없다");
+    }
     let mut sum: u32 = digits[..9]
         .iter()
         .zip(BUSINESS_WEIGHTS)
@@ -170,6 +199,9 @@ pub fn business_registration(digits: &[u8]) -> ChecksumResult {
 pub fn luhn(digits: &[u8]) -> ChecksumResult {
     if !(13..=19).contains(&digits.len()) {
         return ChecksumResult::NotApplicable("카드번호는 13자리에서 19자리다");
+    }
+    if has_masked(digits) {
+        return ChecksumResult::NotApplicable("가려진 자리가 있어 검증식을 적용할 수 없다");
     }
     let mut sum = 0u32;
     for (i, d) in digits.iter().rev().enumerate() {
@@ -211,14 +243,46 @@ pub fn is_valid_date(year: u16, month: u8, day: u8) -> bool {
     (1..=12).contains(&month) && day >= 1 && day <= days_in_month(year, month)
 }
 
-/// 문자열의 각 문자를 숫자 값으로 바꾼다. 숫자가 아닌 문자가 있으면 `None`.
+/// 마스킹된 자리를 나타내는 자릿값.
+///
+/// 0에서 9 범위 밖이라 산술에 섞여 들어가도 값이 오염되지 않고, 검사 한 번으로 걸러진다.
+/// `900513-1****67` 처럼 **이미 부분 마스킹된 문서를 다시 처리**할 때 필요하다. 그런 텍스트를
+/// 숫자가 아니라는 이유로 버리면 개인정보가 그대로 통과한다.
+pub const MASKED: u8 = 10;
+
+/// 마스킹된 자리가 하나라도 있는가.
+pub fn has_masked(digits: &[u8]) -> bool {
+    digits.contains(&MASKED)
+}
+
+/// 마스킹 문자인가. `*`, `X`, `x` 를 받는다.
+fn is_mask_char(b: u8) -> bool {
+    matches!(b, b'*' | b'X' | b'x')
+}
+
+/// 문자열의 각 문자를 자릿값으로 바꾼다. 숫자도 마스킹 문자도 아니면 `None`.
+///
+/// 마스킹 문자는 [`MASKED`] 로 들어간다. 검증식은 그 값을 만나면 판정을 포기하고
+/// [`ChecksumResult::NotApplicable`] 을 내며, 그러면 등급이 `Certain` 에 도달하지 못한다.
+/// **모른다는 사실이 등급으로 표현되는 것**이 이 설계의 요점이다.
 ///
 /// `then_some` 이 아니라 `then` 을 쓴다. 전자는 인자를 즉시 평가하므로 숫자가 아닌 바이트에서
 /// 뺄셈이 음수로 넘쳐 패닉한다.
 pub fn to_digits(text: &str) -> Option<Vec<u8>> {
     text.bytes()
-        .map(|b| b.is_ascii_digit().then(|| b - b'0'))
+        .map(|b| {
+            if is_mask_char(b) {
+                Some(MASKED)
+            } else {
+                b.is_ascii_digit().then(|| b - b'0')
+            }
+        })
         .collect()
+}
+
+/// 실제 숫자(마스킹이 아닌) 자리의 개수.
+pub fn known_count(digits: &[u8]) -> usize {
+    digits.iter().filter(|&&d| d != MASKED).count()
 }
 
 #[cfg(test)]

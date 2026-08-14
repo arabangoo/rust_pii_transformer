@@ -150,6 +150,7 @@ fn reason_name(reason: RejectReason) -> &'static str {
         RejectReason::NoContext => "no_context",
         RejectReason::BelowThreshold => "below_threshold",
         RejectReason::Outranked => "outranked",
+        RejectReason::BusinessContext => "business_context",
     }
 }
 
@@ -683,6 +684,17 @@ impl PyConfig {
         self.inner.min_context = value;
     }
 
+    /// 부정 문맥이 후보를 버릴 수 있게 되는 최소 총점. 기본 0.5.
+    #[getter]
+    fn min_veto(&self) -> f32 {
+        self.inner.min_veto
+    }
+
+    #[setter]
+    fn set_min_veto(&mut self, value: f32) {
+        self.inner.min_veto = value;
+    }
+
     /// 유니코드 조합 패스를 켠다.
     #[getter]
     fn nfc(&self) -> bool {
@@ -714,6 +726,17 @@ impl PyConfig {
     #[setter]
     fn set_hangul(&mut self, value: bool) {
         self.inner.normalize.hangul = value;
+    }
+
+    /// 유사문자 교정 패스를 켠다.
+    #[getter]
+    fn lookalike(&self) -> bool {
+        self.inner.normalize.lookalike
+    }
+
+    #[setter]
+    fn set_lookalike(&mut self, value: bool) {
+        self.inner.normalize.lookalike = value;
     }
 
     /// 구분자 흡수 패스를 켠다.
