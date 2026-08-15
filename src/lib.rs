@@ -10,7 +10,7 @@
 //! 순수 숫자열뿐 아니라 한글 수사 표기(`팔팔공일공일`), 띄어쓰기와 구분자 변형
 //! (`880101 - 1234567`), 한글과 숫자 혼합 표기(`88년 1월 1일생`)를 잡는다.
 //!
-//! ## 3층 파이프라인
+//! ## 4층 파이프라인
 //!
 //! ```text
 //! 원문 → [정규화] → (정규화문, SpanMap) → [탐지] → Finding(정규화 좌표)
@@ -22,25 +22,70 @@
 //!
 //! ## 현재 구현 상태
 //!
-//! **2층(탐지)까지 구현돼 있다.** 마스킹과 합성 검증 코퍼스는 아직 없고, 그래서 재현율과
-//! 정밀도를 수치로 제시하지 못한다. 진행 상황과 남은 범위는 저장소 `README.md` 의 개발 로드맵
-//! 절에 3단계(동작 확인 / 코드만 존재 / 미구현)로 기록한다.
+//! **네 층이 모두 동작한다.** 합성 검증 코퍼스 3,160건 기준 재현율 99.9퍼센트, 정밀도
+//! 99.3퍼센트이고 마스킹 원문 복원 실패는 0건이다. 씨앗이 고정이라 누구든 같은 수를 얻는다.
+//!
+//! ```bash
+//! cargo test --test accuracy -- --nocapture
+//! ```
+//!
+//! 이 수치는 합성 코퍼스에서 잰 값이고 실제 한국어 문서 표본으로 잰 값이 아니다. 회귀를 막고
+//! 변경의 영향을 보는 데는 충분하지만, 자기 데이터에서 다시 재고 임계값을 맞추는 것을 권한다.
+//! 남은 한계는 저장소 `README.md` 의 알려진 한계 절에 적는다.
 //!
 //! | 모듈 | 상태 |
 //! | --- | --- |
 //! | [`span`] | 동작 확인. `SpanMap`, `Segment`, 합성, 역방향 매핑, 불변식 검사 |
-//! | [`normalize`] | 동작 확인. 4개 패스(자모 조합, 전각 폴딩, 한글 수사, 구분자 흡수)와 파이프라인 |
-//! | [`detect`] | 동작 확인. 검증식, 스캐너, 문맥 점수, 오케스트레이션. 정확도 수치는 미측정 |
-//! | `python` | 동작 확인. `span` 층의 PyO3 바인딩 (`--features python`) |
-//! | `mask` | 미구현 |
-//! | `synth` | 미구현 |
+//! | [`normalize`] | 동작 확인. 5개 패스(자모 조합, 전각 폴딩, 한글 수사, 유사문자 교정, 구분자 흡수) |
+//! | [`detect`] | 동작 확인. 검증식, 스캐너, 문맥 점수, 판정 근거와 미탐 사유 |
+//! | [`mask`] | 동작 확인. 정책 4종(전체 치환·부분 노출·해시·토큰화)과 복원 맵 |
+//! | [`synth`] | 동작 확인. 검증식이 유효한 표본과 표기 변형 생성 |
+//! | `python` | 동작 확인. 네 층 전부의 PyO3 바인딩 (`--features python`) |
 //!
-//! ## 지금 쓸 수 있는 것
+//! 해시 가명화 정책은 `hash`, 명령줄 도구 `rpit` 은 `cli` 기능 플래그를 켰을 때만 들어온다.
+//!
+//! ## 탐지
+//!
+//! ```
+//! use rust_pii_transformer::detect::{detect, Config};
+//!
+//! let text = "주민등록번호 팔팔공일공일 - 1234567 로 접수했습니다";
+//! let report = detect(text, &Config::default()).unwrap();
+//!
+//! // 한글 수사와 구분자 변형을 정규화 층이 흡수한 뒤 잡는다.
+//! assert_eq!(report.findings.len(), 1);
+//! let found = &report.findings[0];
+//! assert_eq!(found.source.slice(text), "팔팔공일공일 - 1234567");
+//!
+//! // 왜 걸렸는지가 함께 실린다.
+//! assert_eq!(found.evidence.rule, "resident.korean_13");
+//! assert!(found.evidence.cost.expanded_syllables > 0);
+//! ```
+//!
+//! ## 마스킹
+//!
+//! ```
+//! use rust_pii_transformer::detect::Config;
+//! use rust_pii_transformer::{mask, unmask, Policy, PolicySet};
+//!
+//! let text = "연락처 010-1234-5678 입니다";
+//!
+//! // 토큰화 정책은 원문 복원이 보장된다.
+//! let out = mask(text, &Config::default(), &PolicySet::new(Policy::Tokenize)).unwrap();
+//! assert_ne!(out.text, text);
+//!
+//! let restore = out.restore.as_ref().unwrap();
+//! assert_eq!(unmask(&out.text, restore).unwrap(), text);
+//! ```
+//!
+//! ## 오프셋 매핑을 직접 쓰기
+//!
+//! 자기 정규화 패스를 만들고 그 결과를 원문 좌표로 되돌리고 싶을 때 쓴다.
 //!
 //! ```
 //! use rust_pii_transformer::{Absorbed, Span, SpanMapBuilder};
 //!
-//! // 정규화 패스 하나를 흉내 낸다. "880101-1234567" 에서 하이픈을 흡수한다.
+//! // "880101-1234567" 에서 하이픈을 흡수한다.
 //! let mut builder = SpanMapBuilder::new();
 //! builder.keep("880101");
 //! builder.absorb("-", "separator.hyphen", Absorbed::Separator);

@@ -322,10 +322,24 @@ def test_checksum_reason_is_given_when_not_applicable():
 
 
 def test_rejections_explain_why_a_candidate_was_dropped():
-    report = rpit.detect("접수번호 1234567890123 입니다")
+    """문맥이 필수인 엔티티가 단서 없이 나오면 no_context 로 떨어진다."""
+    report = rpit.detect("첨부 자료 1234567890123 참고하세요")
     assert not report.findings
     reasons = {r.entity: r.reason for r in report.rejections}
     assert reasons["bank_account"] == "no_context"
+
+
+def test_negative_context_outranks_plain_absence_of_context():
+    """부정 문맥 낱말이 있으면 사유가 business_context 로 바뀐다.
+
+    `접수번호` 는 부정 문맥 사전에 있다. 단서가 없는 것(no_context)과 "이건 개인의 것이
+    아니다"라고 말하는 낱말이 있는 것(business_context)은 다른 사건이고, 조사할 때
+    구분되어야 한다.
+    """
+    report = rpit.detect("접수번호 1234567890123 입니다")
+    assert not report.findings
+    reasons = {r.entity: r.reason for r in report.rejections}
+    assert reasons["bank_account"] == "business_context"
 
 
 def test_json_names_match_the_attribute_names():
